@@ -8,7 +8,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import random
+import tempfile
 from pathlib import Path
 
 from . import ffmpeg as F
@@ -57,26 +59,33 @@ def synthetic_words(seconds: float, seed: int = 7, wps: float = 2.6, pause_range
     return words
 
 
+NEWLINE_LEAD_MS = 10  # the '\n' append event that scrolls the window sits this far before the next line
+
+
 def words_to_json3(words: list[Word]) -> dict:
-    """Emit YouTube json3 (ASR-style): one event per sentence, word segs with tOffsetMs."""
-    events = []
+    """Emit YouTube json3 in the real auto-caption (ASR) layout: one text event per sentence line with word segs
+    (tOffsetMs), whose dDurationMs is display time running until the second-next line appears (two lines stay on
+    screen, so consecutive events overlap), plus a `\n` aAppend event NEWLINE_LEAD_MS before every following line.
+    The last two lines are shown until the end of speech."""
+    lines: list[list[Word]] = []
     cur: list[Word] = []
-
-    def flush():
-        if not cur:
-            return
-        t0 = int(cur[0].start * 1000)
-        segs = []
-        for j, w in enumerate(cur):
-            segs.append({"utf8": (" " if j else "") + w.text, "tOffsetMs": int(w.start * 1000) - t0, "acAsrConf": 0})
-        events.append({"tStartMs": t0, "dDurationMs": int(cur[-1].end * 1000) - t0, "wWinId": 1, "segs": segs})
-        cur.clear()
-
     for w in words:
         cur.append(w)
         if w.text.rstrip().endswith((".", "?", "!")):
-            flush()
-    flush()
+            lines.append(cur)
+            cur = []
+    if cur:
+        lines.append(cur)
+    starts = [int(line[0].start * 1000) for line in lines]
+    speech_end = int(words[-1].end * 1000) if words else 0
+    events = []
+    for k, line in enumerate(lines):
+        t0 = starts[k]
+        shown_until = starts[k + 2] if k + 2 < len(lines) else speech_end
+        segs = [{"utf8": (" " if j else "") + w.text, "tOffsetMs": int(w.start * 1000) - t0, "acAsrConf": 0} for j, w in enumerate(line)]
+        events.append({"tStartMs": t0, "dDurationMs": max(shown_until - t0, 1), "wWinId": 1, "segs": segs})
+        if k + 1 < len(lines):
+            events.append({"tStartMs": starts[k + 1] - NEWLINE_LEAD_MS, "dDurationMs": NEWLINE_LEAD_MS, "wWinId": 1, "aAppend": 1, "segs": [{"utf8": "\n"}]})
     return {"wireMagic": "pb3", "pens": [{}], "wsWinStyles": [{}], "wpWinPositions": [{}], "events": events}
 
 
@@ -116,19 +125,25 @@ def make_fixture(out_path: str | Path, seconds: float = 40.0, width: int = 1280,
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     cap_path = out.with_name(out.stem + ".en.json3")
-    ass_path = out.with_name(out.stem + ".fixture.ass")
-    ass_path.write_text(_timecode_ass(seconds, width, height), encoding="utf-8")
+    # The timecode .ass gets a filter-safe temporary name ([A-Za-z0-9_] only, unique per call): the user's file name
+    # may contain characters the subtitles filter parser treats specially (' , ; [ ] : \). The output is passed as
+    # ./<name> so a name starting with '-' is not read as an ffmpeg option.
+    fd, tmp = tempfile.mkstemp(prefix="clipforge_tc_", suffix=".ass", dir=out.parent)
+    os.close(fd)
+    ass_path = Path(tmp)
     audio_expr = "0.6*sin(220*2*PI*t)*gt(mod(t,4),0.6)*(0.35+0.65*abs(sin(t/5)))"
-    vf = f"subtitles={ass_path.name}"
     cmd = F.ffmpeg_cmd(
         "-f", "lavfi", "-i", f"smptehdbars=size={width}x{height}:rate={fps}:duration={seconds}",
         "-f", "lavfi", "-i", f"aevalsrc='{audio_expr}':s=44100:d={seconds}",
-        "-vf", vf,
+        "-vf", f"subtitles={ass_path.name}",
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "96k", "-shortest", "-movflags", "+faststart", out.name,
+        "-c:a", "aac", "-b:a", "96k", "-shortest", "-movflags", "+faststart", "./" + out.name,
     )
-    F.run(cmd, cwd=out.parent, timeout=300)
-    ass_path.unlink(missing_ok=True)
+    try:
+        ass_path.write_text(_timecode_ass(seconds, width, height), encoding="utf-8")
+        F.run(cmd, cwd=out.parent, timeout=300)
+    finally:
+        ass_path.unlink(missing_ok=True)
     words = synthetic_words(seconds, seed=seed)
     cap_path.write_text(json.dumps(words_to_json3(words)), encoding="utf-8")
     return out, cap_path

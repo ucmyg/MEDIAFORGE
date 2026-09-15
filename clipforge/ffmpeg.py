@@ -14,6 +14,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Iterator
 
 import numpy as np
 
@@ -126,8 +127,8 @@ def probe(path: str | Path) -> MediaInfo:
                 info.has_audio = True
                 info.audio_codec = s.get("codec_name", "")
         return info
-    # ---- fallback: ffmpeg -i --------------------------------------------------
-    cp = run([ffmpeg_exe(), "-hide_banner", "-nostdin", "-i", path, "-f", "null", "-"], check=False)
+    # ---- fallback: ffmpeg -i (no output: ffmpeg dumps the stream info and exits with rc=1 without decoding) ----
+    cp = run([ffmpeg_exe(), "-hide_banner", "-nostdin", "-i", path], check=False, timeout=60)
     err = cp.stderr.decode("utf-8", "replace")
     m = _DUR_RE.search(err)
     dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0.0
@@ -209,6 +210,21 @@ def decode_pcm(path: str | Path, start: float | None = None, duration: float | N
     if cp.returncode != 0 or not cp.stdout:
         return np.zeros(0, dtype=np.float32)
     return np.frombuffer(cp.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def iter_pcm_s16(path: str | Path, sr: int = 16000, chunk_samples: int = 1 << 20) -> Iterator[np.ndarray]:
+    """Yield successive int16 mono blocks of the whole audio track (bounded memory: one block at a time, whatever
+    the media length). Yields nothing when ffmpeg fails or there is no audio. Every block but the last holds exactly
+    chunk_samples samples."""
+    cmd = ffmpeg_cmd("-i", str(path), "-vn", "-ac", "1", "-ar", str(sr), "-f", "s16le", "-")
+    log.debug("run: %s", " ".join(_q(c) for c in cmd))
+    # stderr goes to DEVNULL: a PIPE that nobody drains could fill up and deadlock ffmpeg (-loglevel error is set anyway)
+    with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=_CREATION_FLAGS) as p:
+        assert p.stdout is not None
+        while buf := p.stdout.read(chunk_samples * 2):
+            yield np.frombuffer(buf, dtype=np.int16)
+    if p.returncode != 0:
+        log.warning("ffmpeg exited with rc=%d while decoding %s; treating the rest as no audio", p.returncode, path)
 
 
 def gpu_present() -> bool:

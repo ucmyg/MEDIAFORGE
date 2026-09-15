@@ -36,5 +36,13 @@ def setup_logging(log_dir: str | Path | None = None, level: int = logging.INFO) 
         root.addHandler(fh)
 
 
+def console_level() -> int:
+    """Level of the rich console handler (INFO until setup_logging ran); handed to render workers under spawn."""
+    for h in logging.getLogger("clipforge").handlers:
+        if isinstance(h, RichHandler):
+            return h.level
+    return logging.INFO
+
+
 def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name if name.startswith("clipforge") else f"clipforge.{name}")

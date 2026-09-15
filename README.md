@@ -12,7 +12,7 @@ clipforge add <url|file> → run → review → publish   (or: daemon / tick for
 ```bash
 python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-clipforge doctor                                     # ffmpeg, fonts, whisper model, credentials, NVENC, disk
+clipforge doctor                                     # ffmpeg, yt-dlp, fonts, whisper model, credentials, NVENC, disk
 clipforge fixture demo.mp4 --seconds 120             # synthetic 2-minute video + caption sidecar (no network)
 clipforge add demo.mp4 --count 3                     # queue it (per-video options are remembered)
 clipforge run                                        # ingest → transcribe → select → render → metadata
@@ -37,7 +37,7 @@ command on the same video is instant. `clipforge.db` (SQLite, in the workspace) 
 | Stage | Module | Default (free) path | Notes |
 | --- | --- | --- | --- |
 | Ingest | `download.py` | yt-dlp, best mp4 ≤ 1080p, YouTube auto-captions as `json3` | local files are referenced, never copied; `<file>.en.json3` next to a local file is used as captions |
-| Transcribe | `transcribe.py` | json3 → word timestamps (instant) | no captions → faster-whisper (`base` on CPU, int8; `distil-large-v3` on NVIDIA); `--force-whisper` to skip captions |
+| Transcribe | `transcribe.py` | json3 → word timestamps (instant) | no captions → faster-whisper (`base` on CPU, int8; `distil-large-v3` on NVIDIA, which needs `nvidia-cublas-cu12` + `nvidia-cudnn-cu12`; when CUDA is unusable it falls back to the CPU model); `--force-whisper` to skip captions |
 | Select | `select.py` | heuristic scorer (hook, TF-IDF distinctiveness, audio energy, speech-rate variance, completeness, filler, overlap) | `selector.mode: llm` uses any OpenAI-compatible endpoint, one call per video, hard fallback to heuristic |
 | Render | `render.py` + `captions.py` | one ffmpeg command per clip, process pool, only the selected segments are decoded | 9:16 crop (or `--layout blur`), karaoke `.ass` captions, hook card, progress bar, loudnorm −14 LUFS |
 | Metadata | `metadata.py` | title ≤ 100 chars, description, 3–6 hashtags per platform | `clips/<clip_id>.json` beside the mp4 |
@@ -166,6 +166,7 @@ real whisper `tiny` model skips itself when the model cannot be downloaded.
   ffprobe is found.
 * **Synthetic fixtures have no speech.** Word timestamps come from the generated json3 sidecar (the same path real
   YouTube auto-captions take). The pipeline treats a `<stem>.<lang>.json3` file next to any local file as its captions.
-* **Font.** Montserrat ExtraBold (SIL OFL 1.1, `assets/fonts/OFL.txt`) is bundled; nothing needs installing.
+* **Font.** Montserrat ExtraBold (SIL OFL 1.1, `clipforge/assets/fonts/OFL.txt`) is bundled inside the package;
+  nothing needs installing. Drop your own `.ttf`/`.otf` into `<assets>/fonts` to use that directory instead.
 * **Short videos.** When no window of `min_s..max_s` fits, the whole transcript becomes one candidate (if ≥ 5 s).
 * **Logs** go to `logs/` next to the workspace (configurable, gitignored).

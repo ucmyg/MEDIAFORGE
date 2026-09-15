@@ -19,6 +19,12 @@ from pydantic_settings import (
 
 CONFIG_ENV = "CLIPFORGE_CONFIG"
 DEFAULT_CONFIG_FILE = "clipforge.yaml"
+FONT_EXTS = (".ttf", ".otf")
+
+
+def has_font_files(directory: Path) -> bool:
+    """True when `directory` holds at least one .ttf/.otf file."""
+    return directory.is_dir() and any(p.suffix.lower() in FONT_EXTS for p in directory.iterdir())
 
 
 class WhisperCfg(BaseModel):
@@ -48,7 +54,7 @@ class SelectorCfg(BaseModel):
 class StyleCfg(BaseModel):
     """Caption preset. Colors are hex RRGGBB."""
 
-    font: str = "Montserrat ExtraBold"  # family name as seen by libass (fontsdir=assets/fonts)
+    font: str = "Montserrat ExtraBold"  # family name as seen by libass (fontsdir=Settings.fonts_dir)
     font_size: int = 96  # in 1080x1920 pixel space
     uppercase: bool = True
     primary_color: str = "FFFFFF"
@@ -142,7 +148,7 @@ class PathsCfg(BaseModel):
     workspace: str = "workspace"
     db: str = ""  # empty -> <workspace>/clipforge.db
     logs: str = "logs"
-    assets: str = ""  # empty -> <repo>/assets
+    assets: str = ""  # empty -> <repo>/assets (fonts/ and music/ live there)
 
 
 def _yaml_path() -> Path | None:
@@ -203,6 +209,7 @@ class Settings(BaseSettings):
 
     @property
     def fonts_dir(self) -> Path:
+        """<assets>/fonts: the repo's assets/ (editable install) or paths.assets. `clipforge doctor` fails when empty."""
         return self.assets_dir / "fonts"
 
     @property
