@@ -166,7 +166,8 @@ real whisper `tiny` model skips itself when the model cannot be downloaded.
   ffprobe is found.
 * **Synthetic fixtures have no speech.** Word timestamps come from the generated json3 sidecar (the same path real
   YouTube auto-captions take). The pipeline treats a `<stem>.<lang>.json3` file next to any local file as its captions.
-* **Font.** Montserrat ExtraBold (SIL OFL 1.1, `clipforge/assets/fonts/OFL.txt`) is bundled inside the package;
-  nothing needs installing. Drop your own `.ttf`/`.otf` into `<assets>/fonts` to use that directory instead.
+* **Font.** Montserrat ExtraBold (SIL OFL 1.1, licence in `assets/Montserrat-OFL.txt`, kept out of `fonts/` because
+  libass tries to load every file in `fontsdir`) is bundled; nothing needs installing. `paths.assets` points a
+  non-editable install at a folder with `fonts/` and `music/`.
 * **Short videos.** When no window of `min_s..max_s` fits, the whole transcript becomes one candidate (if ≥ 5 s).
 * **Logs** go to `logs/` next to the workspace (configurable, gitignored).

@@ -195,8 +195,8 @@ def test_build_ass_hormozi_document(seg_words):
     doc = C.build_ass(seg_words, style, duration=10.0, hook=hook, hook_seconds=1.8)
     for line in ("[Script Info]", "ScriptType: v4.00+", "PlayResX: 1080", "PlayResY: 1920", "WrapStyle: 2", "ScaledBorderAndShadow: yes", "[V4+ Styles]", "[Events]"):
         assert line in doc.splitlines()
-    assert "Style: Caption,Montserrat ExtraBold,96,&H00FFFFFF,&H0000D4FF,&H00000000," in doc
-    assert re.search(r"^Style: Hook,Montserrat ExtraBold,72,&H00FFFFFF,.*,3,14,0,5,0,0,0,1$", doc, re.M)  # BorderStyle 3 box
+    assert "Style: Caption,Montserrat ExtraBold,120,&H00FFFFFF,&H0000D4FF,&H00000000," in doc
+    assert re.search(r"^Style: Hook,Montserrat ExtraBold,64,&H00FFFFFF,.*,3,14,0,5,0,0,0,1$", doc, re.M)  # BorderStyle 3 box
     events = _events(doc)
     caps = [e for e in events if e["style"] == "Caption"]
     hooks = [e for e in events if e["style"] == "Hook"]
@@ -239,9 +239,9 @@ def test_build_ass_clean_keeps_case_and_outline_hook(seg_words):
     assert len(caps) == len(seg_words)
     assert any(e["plain"] != e["plain"].upper() for e in caps)
     assert all("&HF0C94C&" in e["text"] for e in caps)  # clean accent 4CC9F0
-    assert "Style: Caption,Montserrat ExtraBold,84,&H00FFFFFF,&H00F0C94C,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,5,0,0,0,1" in doc
+    assert "Style: Caption,Montserrat ExtraBold,100,&H00FFFFFF,&H00F0C94C,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,4,0,5,0,0,0,1" in doc
     minimal = C.build_ass(seg_words, DEFAULT_STYLES["minimal"], duration=10.0, hook="No box here")
-    assert re.search(r"^Style: Hook,Montserrat ExtraBold,72,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,[\d.]+,0,5,0,0,0,1$", minimal, re.M)
+    assert re.search(r"^Style: Hook,Montserrat ExtraBold,64,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,[\d.]+,0,5,0,0,0,1$", minimal, re.M)
     hk = [e for e in _events(minimal) if e["style"] == "Hook"][0]
     assert hk["plain"] == "No box here"
 
@@ -294,7 +294,7 @@ def test_build_ass_short_last_word_never_overlaps_next_group():
 def test_build_ass_scales_with_frame_size(seg_words):
     doc = C.build_ass(seg_words, StyleCfg(), duration=10.0, hook="Scaled", width=720, height=1280)
     assert "PlayResX: 720" in doc and "PlayResY: 1280" in doc
-    assert "Style: Caption,Montserrat ExtraBold,64," in doc and ",1,4,2,5,0,0,0,1" in doc  # outline 6 -> 4, shadow 3 -> 2
+    assert "Style: Caption,Montserrat ExtraBold,80," in doc and ",1,4,2,5,0,0,0,1" in doc  # outline 6 -> 4, shadow 3 -> 2
     caps = [e for e in _events(doc) if e["style"] == "Caption"]
     assert all("\\pos(317,794)" in e["text"] for e in caps)
     assert "\\pos(360,154)" in [e for e in _events(doc) if e["style"] == "Hook"][0]["text"]
@@ -312,7 +312,7 @@ def test_font_family_names_match_config_default():
     for name, style in DEFAULT_STYLES.items():
         assert style.font in names, f"style {name!r} font {style.font!r} is not a family libass will find in {FONT.name}"
     with pytest.raises(ValueError):
-        C.font_family_names(FONT.with_name("OFL.txt"))
+        C.font_family_names(FONT.parent.parent / "Montserrat-OFL.txt")
 
 
 # ---- ffmpeg burn-in smoke test ----------------------------------------------

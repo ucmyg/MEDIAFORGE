@@ -55,7 +55,7 @@ class StyleCfg(BaseModel):
     """Caption preset. Colors are hex RRGGBB."""
 
     font: str = "Montserrat ExtraBold"  # family name as seen by libass (fontsdir=Settings.fonts_dir)
-    font_size: int = 96  # in 1080x1920 pixel space
+    font_size: int = 120  # in 1080x1920 pixel space (libass Fontsize; ~0.47*size cap height for Montserrat)
     uppercase: bool = True
     primary_color: str = "FFFFFF"
     accent_color: str = "FFD400"  # active (karaoke) word
@@ -65,15 +65,15 @@ class StyleCfg(BaseModel):
     bold: bool = True
     pos_y: float = 0.62  # fraction of frame height for the caption baseline (keeps out of TikTok UI zone)
     max_words: int = 4  # words per caption group (2..4)
-    hook_font_size: int = 72
+    hook_font_size: int = 64
     hook_color: str = "FFFFFF"
     hook_box: bool = True  # draw a dark box behind the hook card
 
 
 DEFAULT_STYLES: dict[str, StyleCfg] = {
     "hormozi": StyleCfg(),
-    "clean": StyleCfg(uppercase=False, font_size=84, accent_color="4CC9F0", outline=4.0, shadow=0.0),
-    "minimal": StyleCfg(uppercase=False, font_size=72, accent_color="FFFFFF", primary_color="DDDDDD", outline=2.5, shadow=0.0, bold=False, hook_box=False),
+    "clean": StyleCfg(uppercase=False, font_size=100, accent_color="4CC9F0", outline=4.0, shadow=0.0),
+    "minimal": StyleCfg(uppercase=False, font_size=84, accent_color="FFFFFF", primary_color="DDDDDD", outline=2.5, shadow=0.0, bold=False, hook_box=False),
 }
 
 
