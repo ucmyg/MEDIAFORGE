@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clipforge"
+version = "0.1.0"
+description = "Turn long-form videos into captioned vertical short clips and publish them - local, free, CLI-first."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "yt-dlp>=2024.8",
+  "faster-whisper>=1.0",
+  "typer>=0.12",
+  "rich>=13",
+  "pydantic>=2.5",
+  "pydantic-settings>=2.2",
+  "pyyaml>=6",
+  "numpy>=1.26",
+  "opencv-python-headless>=4.8,<5",
+  "google-api-python-client>=2.100",
+  "google-auth-oauthlib>=1.2",
+  "requests>=2.31",
+  "pyperclip>=1.8",
+  "imageio-ffmpeg>=0.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-timeout>=2.3"]
+browser = ["playwright>=1.45"]
+
+[project.scripts]
+clipforge = "clipforge.cli:app"
+
+[tool.setuptools.packages.find]
+include = ["clipforge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"
