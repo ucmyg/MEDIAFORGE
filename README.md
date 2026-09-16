@@ -7,6 +7,10 @@ YouTube Shorts and/or TikTok. Local, CPU-only, $0 runtime, CLI-first, idempotent
 clipforge add <url|file>  →  run  →  review  →  publish        (or: daemon / tick for hands-off scheduling)
 ```
 
+## Windows, no terminal
+
+Double-click **`Install ClipForge.bat`**, then the **ClipForge** shortcut. See [INSTALL.md](INSTALL.md).
+
 ## 5-minute quickstart
 
 ```bash
