@@ -293,7 +293,8 @@
     S.polling = true;
     const gen = S.gen;
     try {
-      const state = await api('GET', '/api/state', undefined, { timeoutMs: 15000 });
+      const q = S.review && S.review.video ? '?video=' + encodeURIComponent(S.review.video) : '';
+      const state = await api('GET', '/api/state' + q, undefined, { timeoutMs: 15000 });
       S.failing = false;
       setOffline(false);
       if (gen === S.gen) { S.state = normaliseState(state); render(); checkWatchers(); }
@@ -608,7 +609,9 @@
       else if (f.status === 'all') setText(empty, 'No clips for this video.');
       else setText(empty, `No ${f.status} clips${f.video ? ' for this video' : ''} - ${plural(st.clips.length, 'clip')} in other statuses (set Status to "all").`);
     }
-    setText($('#review-count'), clips.length ? plural(clips.length, 'clip') : '');
+    const tr = S.state && S.state.truncated && S.state.truncated.clips && !S.review.video;
+    const total = S.state && S.state.totals ? S.state.totals.clips : null;
+    setText($('#review-count'), clips.length ? plural(clips.length, 'clip') + (tr && total ? ` shown of ${total} - pick a video to see all of its clips` : '') : '');
     const rendered = st.clips.filter((c) => c.status === 'rendered' && (!S.review.video || c.video_id === S.review.video));
     const bulk = $('#approve-all');
     bulk.disabled = rendered.length === 0;
@@ -1258,7 +1261,7 @@
     for (const [id, key] of [['#review-video', 'video'], ['#review-status', 'status'], ['#review-sort', 'sort']]) {
       const sel = $(id);
       if (key !== 'video') sel.value = S.review[key];
-      sel.addEventListener('change', () => { S.review[key] = sel.value; render(); });
+      sel.addEventListener('change', () => { S.review[key] = sel.value; render(); if (key === 'video') refresh(); });
     }
     $('#select-all').addEventListener('change', (ev) => {
       if (!S.state) return;

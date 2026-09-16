@@ -45,7 +45,7 @@ from typing import Any, AsyncIterator, Callable, Iterable, Literal, get_args, ge
 from urllib.parse import parse_qs, urlsplit
 
 import yaml
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -441,17 +441,40 @@ def _settings_block(settings: Settings) -> dict[str, Any]:
     }
 
 
-def _state_payload(st: Any) -> dict[str, Any]:
+STATE_CLIPS_DEFAULT = 500  # clips per /api/state unless ?video= narrows it or ?clips_limit= changes it (0 = all)
+STATE_VIDEOS_DEFAULT = 500
+
+
+def _state_payload(st: Any, *, video: str | None = None, clips_limit: int = STATE_CLIPS_DEFAULT, videos_limit: int = STATE_VIDEOS_DEFAULT) -> dict[str, Any]:
+    """Everything the UI polls. Bounded: the newest `clips_limit` clips (or one video's clips with `video`) and the
+    newest `videos_limit` videos; `totals`/`truncated` say what was left out so the page can offer a filter."""
     settings, db = st.settings, st.db
-    clips = db.list_clips()
+    total_clips = db.count_clips()
+    if video:
+        clips = db.list_clips(video_id=video)
+        clips_truncated = False
+    elif clips_limit and total_clips > clips_limit:
+        clips = db.list_clips_recent(clips_limit)
+        clips_truncated = True
+    else:
+        clips = db.list_clips()
+        clips_truncated = False
     posts = _latest_posts(db)
-    counts = Counter(c.video_id for c in clips)
+    all_videos = db.list_videos()
+    counts = Counter(c.video_id for c in (clips if video is None and not clips_truncated else db.list_clips()))
+    videos = all_videos
+    videos_truncated = bool(videos_limit) and len(all_videos) > videos_limit
+    if videos_truncated:
+        videos = sorted(all_videos, key=lambda v: (v.created_at, v.id), reverse=True)[:videos_limit]
+        videos = sorted(videos, key=lambda v: (v.created_at, v.id))
     return {
-        "videos": [serialize.video_dict(v, counts.get(v.id, 0)) for v in db.list_videos()],
+        "videos": [serialize.video_dict(v, counts.get(v.id, 0)) for v in videos],
         "clips": [serialize.clip_dict(c, {p: posts.get((c.id, p)) for p in PLATFORMS}, serialize.load_meta(c)) for c in clips],
         "jobs": [j.to_dict() for j in st.jobs.list()],
         "scheduler": _scheduler_block(st),
         "settings": _settings_block(settings),
+        "totals": {"videos": len(all_videos), "clips": total_clips},
+        "truncated": {"videos": videos_truncated, "clips": clips_truncated},
     }
 
 
@@ -606,8 +629,12 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one closure per rout
 
     # ---- state -------------------------------------------------------------------------------------------------------------
     @app.get("/api/state")
-    def api_state() -> dict[str, Any]:
-        return _state_payload(st)
+    def api_state(
+        video: str | None = None,
+        clips_limit: int = Query(STATE_CLIPS_DEFAULT, ge=0, le=20000),
+        videos_limit: int = Query(STATE_VIDEOS_DEFAULT, ge=0, le=20000),
+    ) -> dict[str, Any]:
+        return _state_payload(st, video=video, clips_limit=clips_limit, videos_limit=videos_limit)
 
     # ---- videos ------------------------------------------------------------------------------------------------------------
     @app.post("/api/videos")
@@ -701,6 +728,7 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one closure per rout
     def put_clip_meta(clip_id: str, body: MetaBody) -> dict[str, Any]:
         settings, db = st.settings, st.db
         clip = _clip_or_404(db, clip_id)
+        serialize.forget_meta(clip.meta_path)  # the rewrite below must never be served from the poll cache
         title = " ".join(body.title.split())
         if not title:
             raise HTTPException(400, "title must not be empty")

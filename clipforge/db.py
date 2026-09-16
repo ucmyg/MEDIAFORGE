@@ -58,6 +58,10 @@ CREATE TABLE IF NOT EXISTS posts (
   claimed_at TEXT                           -- set while a process holds the row as `uploading`
 );
 CREATE UNIQUE INDEX IF NOT EXISTS posts_unique_posted ON posts(clip_id, platform) WHERE status = 'posted';
+-- get_post / is_posted / claim_post look up the latest row per (clip, platform): was a full scan of posts
+CREATE INDEX IF NOT EXISTS posts_clip_platform_id ON posts(clip_id, platform, id);
+-- list_clips(video_id) with ORDER BY video_id, idx: was a scan plus a temp b-tree sort
+CREATE INDEX IF NOT EXISTS clips_video_idx ON clips(video_id, idx);
 CREATE TABLE IF NOT EXISTS budget (
   platform TEXT NOT NULL,
   day TEXT NOT NULL,               -- YYYY-MM-DD (platform's reset timezone; youtube = America/Los_Angeles)
@@ -254,6 +258,16 @@ class DB:
         sql = "SELECT * FROM clips" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY video_id, idx"
         with self.connect() as c:
             return [_row_clip(r) for r in c.execute(sql, args).fetchall()]
+
+    def list_clips_recent(self, limit: int) -> list[Clip]:
+        """The `limit` most recently created clips (deterministic: created_at DESC, id DESC), returned in (video, idx) order."""
+        with self.connect() as c:
+            rows = c.execute("SELECT * FROM clips ORDER BY created_at DESC, id DESC LIMIT ?", (int(limit),)).fetchall()
+        return sorted((_row_clip(r) for r in rows), key=lambda x: (x.video_id, x.idx))
+
+    def count_clips(self) -> int:
+        with self.connect() as c:
+            return int(c.execute("SELECT COUNT(*) AS n FROM clips").fetchone()["n"])
 
     def update_clip(self, id: str, **fields: Any) -> None:
         fields["updated_at"] = utcnow()

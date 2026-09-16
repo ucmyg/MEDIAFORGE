@@ -89,3 +89,32 @@ def test_reserve_and_claim_counts_posts_and_live_claims(db: DB):
     assert db.count_active("yt", day, stale) == 2 and db.latest_activity("yt", stale) == now
     assert db.has_posted("v_00") and db.has_posted("v_01") and not db.has_posted("v_02")
     assert db.reserve_and_claim("v_02", "yt", now, stale, per_day=3, **kw) == "ok"
+
+
+def test_hot_lookups_use_the_new_indexes(db: DB):
+    """get_post/is_posted/claims look up (clip, platform); list_clips(video_id) orders by (video_id, idx)."""
+    with db.connect() as c:
+        plan = " ".join(r[3] for r in c.execute("EXPLAIN QUERY PLAN SELECT * FROM posts WHERE clip_id=? AND platform=? ORDER BY id DESC LIMIT 1", ("a", "b")))
+        assert "posts_clip_platform_id" in plan and "SCAN posts" not in plan
+        plan = " ".join(r[3] for r in c.execute("EXPLAIN QUERY PLAN SELECT * FROM clips WHERE video_id=? ORDER BY video_id, idx", ("v",)))
+        assert "clips_video_idx" in plan and "TEMP B-TREE" not in plan
+
+
+def test_existing_db_gains_the_indexes_on_open(tmp_path: Path):
+    path = tmp_path / "old.db"
+    con = sqlite3.connect(path)
+    con.executescript(SCHEMA.replace("CREATE INDEX IF NOT EXISTS posts_clip_platform_id ON posts(clip_id, platform, id);", "").replace("CREATE INDEX IF NOT EXISTS clips_video_idx ON clips(video_id, idx);", ""))
+    con.close()
+    DB(path)
+    con = sqlite3.connect(path)
+    names = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+    assert {"posts_clip_platform_id", "clips_video_idx", "posts_unique_posted"} <= names
+
+
+def test_list_clips_recent_and_count(db: DB):
+    db.add_video("v", "local", "x.mp4")
+    for i in range(5):
+        db.upsert_clip(f"v_{i:02d}", "v", i, 0.0, 1.0, 0.0, "")
+    assert db.count_clips() == 5
+    recent = db.list_clips_recent(2)
+    assert [c.id for c in recent] == ["v_03", "v_04"]  # newest two (same created_at second -> highest ids), returned in idx order

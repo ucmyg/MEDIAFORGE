@@ -31,4 +31,20 @@ done in-session. Full suite: `pytest` (444+ tests, ~31 s).
   ydl opts, health 200/503, no path leak); affected files 158 passed; full suite below.
 - Not changed: scheduler `backoff_delay` stays deterministic (single process per workspace; tests pin exact values).
 
-## Next batch — 3: /api/state query batching, two indexes with EXPLAIN evidence, pagination
+## Batch 3 — state payload, indexes, pagination — DONE
+- Findings: `/api/state` (polled every 2 s) re-read every clip's metadata JSON from disk and returned every clip;
+  `get_post`/`is_posted`/claims scanned `posts`; `list_clips(video_id)` scanned `clips` plus a temp b-tree sort.
+- Changes: metadata cache keyed by (path, mtime_ns, size) with an explicit bust on the meta route
+  (`ui/serialize.py`, `ui/server.py`); `/api/state` bounded to the newest 500 clips / 500 videos with `?video=`,
+  `?clips_limit=` (0 = all), `?videos_limit=` plus `totals` and `truncated` fields; the Review tab polls with
+  `?video=` when a video is selected and shows "N shown of M"; two additive indexes created on open
+  (`posts(clip_id, platform, id)`, `clips(video_id, idx)`; `db.py` SCHEMA, no data migration).
+- Evidence (SYNTHETIC: 40 videos x 50 clips, 667 posted rows, TestClient in-process):
+  `/api/state` default 95 ms / 1000 KB -> 35 ms / 257 KB (500 newest); all 2000 clips with a warm cache 54 ms;
+  `?video=` 21 ms / 35 KB. `EXPLAIN QUERY PLAN`: `SCAN posts` -> `SEARCH posts USING INDEX posts_clip_platform_id`;
+  `SCAN clips + TEMP B-TREE` -> `SEARCH clips USING INDEX clips_video_idx`. Write cost: two small b-trees on tables
+  that change a few rows per minute at most.
+- Verification: new tests (bounded state, video filter, deterministic order, global counts, cache freshness after
+  PUT/corruption/deletion, index use via EXPLAIN, old DB gains indexes on open); full suite 459 passed.
+
+## Next batch — 4: contrast + 375/768/1280 overflow check, pending states, request logging

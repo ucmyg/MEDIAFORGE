@@ -226,7 +226,8 @@ def test_request_guard_blocks_rebinding_and_cross_site_posts(api: TestClient, se
 def test_state_shape(api: TestClient, settings: Settings, db: DB):
     stub_clip(db, settings.workspace_dir, "vid_00")
     state = api.get("/api/state").json()
-    assert set(state) == {"videos", "clips", "jobs", "scheduler", "settings"}
+    assert set(state) == {"videos", "clips", "jobs", "scheduler", "settings", "totals", "truncated"}
+    assert state["totals"] == {"videos": 1, "clips": 1} and state["truncated"] == {"videos": False, "clips": False}
     (video,) = state["videos"]
     assert video["id"] == VID and video["status"] == "done" and video["clip_count"] == 1 and video["options"] == {}
     (clip,) = state["clips"]
@@ -964,3 +965,35 @@ def test_health_liveness_and_readiness(api: TestClient, monkeypatch):
     degraded = api.get("/api/health", params={"ready": "1"})
     assert degraded.status_code == 503 and degraded.json()["status"] == "degraded" and degraded.json()["checks"]["ffmpeg"] is False
     assert "/" not in json.dumps(degraded.json())  # no paths leak
+
+
+# ---- hardening batch 3: bounded state, metadata cache -------------------------------------------------------------
+def test_state_is_bounded_and_video_filter_returns_everything_for_that_video(api: TestClient, settings: Settings, db: DB):
+    for v in ("va", "vb", "vc"):
+        for i in range(3):
+            stub_clip(db, settings.workspace_dir, f"{v}_{i:02d}", video_id=v, idx=i)
+    full = api.get("/api/state").json()
+    assert full["totals"]["clips"] == 9 and len(full["clips"]) == 9 and full["truncated"]["clips"] is False
+    bounded = api.get("/api/state", params={"clips_limit": 4}).json()
+    assert len(bounded["clips"]) == 4 and bounded["truncated"]["clips"] is True and bounded["totals"]["clips"] == 9
+    assert [c["id"] for c in bounded["clips"]] == sorted(c["id"] for c in bounded["clips"])  # deterministic (video, idx) order
+    assert all(v["clip_count"] == 3 for v in bounded["videos"])  # counts stay global
+    one = api.get("/api/state", params={"video": "vb", "clips_limit": 1}).json()
+    assert [c["id"] for c in one["clips"]] == ["vb_00", "vb_01", "vb_02"] and one["truncated"]["clips"] is False
+    videos = api.get("/api/state", params={"videos_limit": 2}).json()
+    assert len(videos["videos"]) == 2 and videos["truncated"]["videos"] is True and videos["totals"]["videos"] == 3
+    assert api.get("/api/state", params={"clips_limit": -1}).status_code == 400
+
+
+def test_meta_cache_serves_fresh_data_after_edits(api: TestClient, settings: Settings, db: DB):
+    from clipforge.ui import serialize
+
+    clip = stub_clip(db, settings.workspace_dir, "vid_00")
+    assert api.get("/api/state").json()["clips"][0]["meta"]["title"] == "Title vid_00"
+    assert str(clip.meta_path) in serialize._meta_cache
+    api.put("/api/clips/vid_00/meta", json={"title": "Edited", "description": "d", "hashtags": {"youtube": ["#shorts", "#a", "#b"], "tiktok": ["#fyp", "#a", "#b"]}})
+    assert api.get("/api/state").json()["clips"][0]["meta"]["title"] == "Edited"
+    Path(clip.meta_path).write_text("{not json", encoding="utf-8")  # external corruption: size changed -> re-read -> None
+    assert api.get("/api/state").json()["clips"][0]["meta"] is None
+    Path(clip.meta_path).unlink()
+    assert api.get("/api/state").json()["clips"][0]["meta"] is None and str(clip.meta_path) not in serialize._meta_cache

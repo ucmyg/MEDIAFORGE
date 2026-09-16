@@ -1,6 +1,8 @@
 """DB dataclasses, metadata and limits -> the JSON dicts of /api/state (see the API contract in server.py)."""
 from __future__ import annotations
 
+import os
+
 import re
 from pathlib import Path
 from typing import Any
@@ -38,15 +40,42 @@ def media_url(clip: Clip) -> str | None:
     return f"{MEDIA_PREFIX}/{clip.video_id}/clips/{path.name}"
 
 
+META_CACHE_MAX = 5000
+_meta_cache: dict[str, tuple[int, int, ClipMeta | None]] = {}  # meta_path -> (mtime_ns, size, parsed)
+
+
+def forget_meta(meta_path: str | None) -> None:
+    """Drop a cached metadata file (called after the UI rewrites it, so a same-second rewrite is never served stale)."""
+    if meta_path:
+        _meta_cache.pop(str(meta_path), None)
+
+
 def load_meta(clip: Clip) -> ClipMeta | None:
-    """The clip's metadata file, None when missing or unreadable (never raises)."""
+    """The clip's metadata file, None when missing or unreadable (never raises).
+
+    Cached per path by (mtime_ns, size): the UI polls /api/state every 2 s and re-reading every clip's JSON was the
+    dominant cost with a few hundred clips. A rewrite changes mtime/size (and the meta route also calls forget_meta).
+    """
     if not clip.meta_path:
         return None
+    key = str(clip.meta_path)
     try:
-        return read_meta(clip.meta_path)
-    except Exception as err:  # OSError, JSON errors, a stale shape (TypeError)
-        log.debug("meta %s unreadable: %s: %s", clip.meta_path, type(err).__name__, err)
+        stat = os.stat(key)
+    except OSError:
+        _meta_cache.pop(key, None)
         return None
+    cached = _meta_cache.get(key)
+    if cached is not None and cached[0] == stat.st_mtime_ns and cached[1] == stat.st_size:
+        return cached[2]
+    try:
+        meta: ClipMeta | None = read_meta(key)
+    except Exception as err:  # JSON errors, a stale shape (TypeError)
+        log.debug("meta %s unreadable: %s: %s", key, type(err).__name__, err)
+        meta = None
+    if len(_meta_cache) >= META_CACHE_MAX:
+        _meta_cache.clear()
+    _meta_cache[key] = (stat.st_mtime_ns, stat.st_size, meta)
+    return meta
 
 
 def meta_dict(meta: ClipMeta | None) -> dict[str, Any] | None:
