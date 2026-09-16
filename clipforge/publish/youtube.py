@@ -20,7 +20,9 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import socket
 import time
+import webbrowser
 from datetime import datetime, timezone, tzinfo
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -44,6 +46,7 @@ VIDEOS_RESOURCE_DOC = "https://developers.google.com/youtube/v3/docs/videos"  # 
 CLOUD_CONSOLE_URL = "https://console.cloud.google.com/apis/credentials"
 SHORTS_URL = "https://youtube.com/shorts/{video_id}"
 NO_BROWSER_ENV = "CLIPFORGE_NO_BROWSER"  # =1 -> auth never tries to open a browser; the sign-in URL is printed instead
+FLOW_TIMEOUT_S: float | None = 600  # how long the loopback server waits for the browser redirect before the sign-in fails
 MIME_TYPE = "video/mp4"
 CHUNK_SIZE = 8 * 1024 * 1024  # resumable upload chunk; the API requires a multiple of 256 KiB
 TITLE_MAX = 100  # snippet.title (VIDEOS_RESOURCE_DOC)
@@ -109,6 +112,13 @@ def video_tags(meta: ClipMeta) -> list[str]:
 def open_browser_allowed() -> bool:
     """False when CLIPFORGE_NO_BROWSER=1 (headless machines: the sign-in URL is printed for copy/paste instead)."""
     return os.environ.get(NO_BROWSER_ENV, "") != "1"
+
+
+def _free_loopback_port() -> int:
+    """A currently free TCP port on localhost for the OAuth redirect server (bound briefly, then released)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("localhost", 0))
+        return s.getsockname()[1]
 
 
 def setup_instructions(client_secret: Path) -> str:
@@ -197,6 +207,9 @@ def _video_id(response: dict[str, Any]) -> str:
 class YouTubePublisher(Publisher):
     name = "youtube"
 
+    flow_timeout_s: float | None = FLOW_TIMEOUT_S  # None waits forever (Ctrl-C on the CLI); the UI job keeps the bound
+    on_auth_url: Callable[[str], None] | None = None  # receives the sign-in URL before the flow blocks (the UI shows it)
+
     def __init__(self, settings: Settings, db: DB, sleep: Sleep = time.sleep):
         super().__init__(settings, db)
         self.cfg: YouTubeCfg = settings.platforms.youtube
@@ -278,16 +291,37 @@ class YouTubePublisher(Publisher):
         return True
 
     def _run_flow(self) -> Credentials:
-        """Desktop OAuth flow on a loopback port; blocks until the browser redirects back."""
+        """Desktop OAuth flow on a loopback port; blocks until the browser redirects back or `flow_timeout_s` elapses
+        (google_auth_oauthlib raises WSGITimeoutError then, which auth() reports as a failed sign-in).
+
+        The redirect port is picked up front so the sign-in URL exists before anything can fail: it is printed, handed
+        to `on_auth_url`, and only then is the browser opened (a machine without one just logs a warning). The state
+        and PKCE verifier of that URL are pinned so the library's own second authorization_url() call reuses them.
+        """
         from google_auth_oauthlib.flow import InstalledAppFlow
 
         flow = InstalledAppFlow.from_client_secrets_file(str(self.client_secret_path), SCOPES)
+        port = _free_loopback_port()
+        flow.redirect_uri = f"http://localhost:{port}/"
+        auth_url, state = flow.authorization_url(prompt="consent")
+        flow.autogenerate_code_verifier = False  # keep the verifier behind auth_url's code_challenge
         console.print(
-            "youtube: opening Google sign-in. If no browser opens, copy the URL printed below into a browser on this "
-            f"machine (the redirect goes to localhost). Set {NO_BROWSER_ENV}=1 to skip the browser launch.",
+            "youtube: opening Google sign-in. If no browser opens, copy this URL into a browser on this machine "
+            f"(the redirect goes to localhost; set {NO_BROWSER_ENV}=1 to skip the browser launch):\n{escape(auth_url)}",
             highlight=False,
+            soft_wrap=True,
         )
-        return flow.run_local_server(port=0, open_browser=open_browser_allowed(), prompt="consent")
+        if self.on_auth_url is not None:
+            self.on_auth_url(auth_url)
+        if open_browser_allowed():
+            try:
+                if not webbrowser.open(auth_url, new=1, autoraise=True):
+                    log.warning("youtube: no browser opened the sign-in URL; open it by hand")
+            except Exception as err:  # webbrowser.Error (nothing to run) or a broken $BROWSER entry
+                log.warning("youtube: could not open a browser (%s: %s); open the sign-in URL by hand", type(err).__name__, err)
+        return flow.run_local_server(
+            port=port, open_browser=False, authorization_prompt_message=None, prompt="consent", state=state, timeout_seconds=self.flow_timeout_s
+        )
 
     def _save_credentials(self, creds: Credentials) -> None:
         path = self.token_path

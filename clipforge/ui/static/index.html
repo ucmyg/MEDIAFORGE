@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<meta name="description" content="Local control panel for the ClipForge pipeline: queue videos, review clips, publish and schedule.">
+<title>ClipForge</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div id="offline-banner" class="banner" role="alert" hidden>Server unreachable - retrying every 5 s</div>
+
+<div class="app">
+  <nav class="side" aria-label="Sections">
+    <div class="tabs" role="tablist" aria-orientation="vertical" id="tablist">
+      <button class="tab" role="tab" type="button" id="tabbtn-dashboard" data-tab="dashboard" aria-selected="true" aria-controls="tab-dashboard">Dashboard</button>
+      <button class="tab" role="tab" type="button" id="tabbtn-review" data-tab="review" aria-selected="false" aria-controls="tab-review" tabindex="-1">Review</button>
+      <button class="tab" role="tab" type="button" id="tabbtn-publish" data-tab="publish" aria-selected="false" aria-controls="tab-publish" tabindex="-1">Publish</button>
+      <button class="tab" role="tab" type="button" id="tabbtn-schedule" data-tab="schedule" aria-selected="false" aria-controls="tab-schedule" tabindex="-1">Schedule</button>
+      <button class="tab" role="tab" type="button" id="tabbtn-settings" data-tab="settings" aria-selected="false" aria-controls="tab-settings" tabindex="-1">Settings</button>
+    </div>
+    <div id="nav-busy" class="nav-busy" role="status" hidden><span class="spinner" aria-hidden="true"></span><span id="nav-busy-text">Working</span></div>
+  </nav>
+
+  <main>
+    <!-- ================= Dashboard ================= -->
+    <section class="panel" id="tab-dashboard" role="tabpanel" aria-labelledby="tabbtn-dashboard">
+      <header class="panel-head">
+        <h1>Dashboard</h1>
+        <button class="btn btn-primary" id="run-queue" type="button" title="Process every queued video (pipeline.process_queue)">Run queue</button>
+      </header>
+
+      <section class="card">
+        <h2>Add video</h2>
+        <form id="add-form" class="form-grid" autocomplete="off" novalidate>
+          <div class="field span-all">
+            <label for="f-source">Source (URL or local path)</label>
+            <input id="f-source" name="source" type="text" required placeholder="YouTube URL or /path/to/video.mp4" spellcheck="false">
+          </div>
+          <div class="field"><label for="f-count">Clips</label><input id="f-count" name="count" type="number" min="1" max="50" step="1" inputmode="numeric"></div>
+          <div class="field"><label for="f-min">Min seconds</label><input id="f-min" name="min_s" type="number" min="1" step="any" inputmode="decimal"></div>
+          <div class="field"><label for="f-max">Max seconds</label><input id="f-max" name="max_s" type="number" min="1" step="any" inputmode="decimal"></div>
+          <div class="field"><label for="f-style">Style</label><select id="f-style" name="style"></select></div>
+          <div class="field"><label for="f-layout">Layout</label>
+            <select id="f-layout" name="layout"><option value="crop">crop</option><option value="blur">blur</option></select>
+          </div>
+          <fieldset class="checks span-all">
+            <legend class="sr-only">Options</legend>
+            <label><input type="checkbox" name="tighten"> tighten <span class="muted">(remove silences)</span></label>
+            <label><input type="checkbox" name="smart"> smart <span class="muted">(face-tracked crop)</span></label>
+            <label><input type="checkbox" name="punch"> punch <span class="muted">(zoom on hook words)</span></label>
+            <label><input type="checkbox" name="force_whisper"> force whisper <span class="muted">(ignore captions)</span></label>
+          </fieldset>
+          <div class="form-actions span-all">
+            <button class="btn btn-primary" type="submit">Add to queue</button>
+            <p class="form-error" id="add-error" role="alert" hidden></p>
+          </div>
+        </form>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Videos</h2><span class="muted small" id="videos-count"></span></div>
+        <p class="empty" id="videos-empty">No videos yet - paste a URL above.</p>
+        <div class="table-wrap">
+          <table class="stack" id="videos-table" hidden>
+            <thead><tr><th scope="col">Video</th><th scope="col">Status</th><th scope="col">Duration</th><th scope="col">Clips</th><th scope="col">Error</th><th scope="col">Actions</th></tr></thead>
+            <tbody id="videos-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>Jobs</h2><span class="muted small" id="jobs-count"></span></div>
+        <p class="empty" id="jobs-empty">No jobs yet - add a video and press Run.</p>
+        <ul class="jobs" id="jobs-list"></ul>
+      </section>
+    </section>
+
+    <!-- ================= Review ================= -->
+    <section class="panel" id="tab-review" role="tabpanel" aria-labelledby="tabbtn-review" hidden>
+      <header class="panel-head">
+        <h1>Review</h1>
+        <button class="btn btn-primary" id="approve-all" type="button">Approve all rendered</button>
+      </header>
+      <div class="toolbar">
+        <label class="inline-field">Video <select id="review-video"></select></label>
+        <label class="inline-field">Status
+          <select id="review-status">
+            <option value="rendered">rendered</option>
+            <option value="ready">ready</option>
+            <option value="rejected">rejected</option>
+            <option value="posted">posted</option>
+            <option value="all">all</option>
+          </select>
+        </label>
+        <label class="inline-field">Sort
+          <select id="review-sort">
+            <option value="score_desc">score, high first</option>
+            <option value="score_asc">score, low first</option>
+            <option value="position">position in video</option>
+          </select>
+        </label>
+        <span class="muted small" id="review-count"></span>
+        <span class="muted small hint">Keys on a focused card: A approve, R reject</span>
+      </div>
+      <p class="empty" id="review-empty">No clips yet - run a video from the Dashboard.</p>
+      <div class="clip-grid" id="review-grid"></div>
+    </section>
+
+    <!-- ================= Publish ================= -->
+    <section class="panel" id="tab-publish" role="tabpanel" aria-labelledby="tabbtn-publish" hidden>
+      <header class="panel-head"><h1>Publish</h1></header>
+
+      <div class="two-col">
+        <section class="card platform" id="plat-youtube">
+          <div class="card-head"><h2>YouTube</h2><span class="pill" data-role="configured">-</span></div>
+          <p class="limits" data-role="limits">-</p>
+          <p class="muted small" data-role="note"></p>
+          <div class="row">
+            <button class="btn" type="button" id="connect-youtube">Connect YouTube</button>
+            <span class="muted small">Opens the Google sign-in in a browser on the machine running the server.</span>
+          </div>
+          <pre class="form-error" id="youtube-error" role="alert" hidden></pre>
+        </section>
+        <section class="card platform" id="plat-tiktok">
+          <div class="card-head"><h2>TikTok</h2><span class="pill" data-role="configured">-</span></div>
+          <p class="limits" data-role="limits">-</p>
+          <p class="muted small" data-role="note"></p>
+          <div class="row"><button class="btn" type="button" id="connect-tiktok">Connect TikTok</button></div>
+          <div id="tiktok-auth" class="auth-box" hidden>
+            <p>1. Open the authorisation link, approve the app, then copy the address you land on.</p>
+            <div class="row">
+              <a id="tiktok-auth-url" class="btn" href="#" target="_blank" rel="noopener noreferrer">Open TikTok authorisation</a>
+              <button class="btn" type="button" id="tiktok-copy">Copy link</button>
+            </div>
+            <p class="mono small break" id="tiktok-auth-text"></p>
+            <form id="tiktok-complete-form" class="field">
+              <label for="tiktok-redirect">2. Paste the URL you were redirected to</label>
+              <div class="row">
+                <input id="tiktok-redirect" type="text" required spellcheck="false" placeholder="redirect URL with code and state">
+                <button class="btn btn-primary" type="submit">Complete</button>
+              </div>
+            </form>
+          </div>
+          <pre class="form-error" id="tiktok-error" role="alert" hidden></pre>
+        </section>
+      </div>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>Clips</h2>
+          <div class="row publish-controls">
+            <span class="muted small">Publish selected to</span>
+            <label class="check"><input type="checkbox" id="pub-youtube" checked> youtube</label>
+            <label class="check"><input type="checkbox" id="pub-tiktok" checked> tiktok</label>
+            <button class="btn btn-primary" id="publish-selected" type="button" disabled>Publish selected</button>
+          </div>
+        </div>
+        <p class="empty" id="publish-empty">No ready clips - approve clips in Review first.</p>
+        <div class="table-wrap">
+          <table class="stack publish" id="publish-table" hidden>
+            <thead><tr>
+              <th scope="col" class="col-check"><input type="checkbox" id="select-all" aria-label="Select all clips"></th>
+              <th scope="col">Clip</th><th scope="col">YouTube</th><th scope="col">TikTok</th>
+            </tr></thead>
+            <tbody id="publish-body"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card" id="publish-result-card" hidden>
+        <div class="card-head"><h2>Last publish job</h2><span id="publish-job-status"></span></div>
+        <div id="publish-result"></div>
+      </section>
+    </section>
+
+    <!-- ================= Schedule ================= -->
+    <section class="panel" id="tab-schedule" role="tabpanel" aria-labelledby="tabbtn-schedule" hidden>
+      <header class="panel-head">
+        <h1>Schedule</h1>
+        <div class="row">
+          <span class="dot" id="sched-dot" aria-hidden="true"></span>
+          <span id="sched-state">stopped</span>
+          <button class="btn btn-primary" id="sched-toggle" type="button">Start scheduler</button>
+        </div>
+      </header>
+      <div class="two-col">
+        <section class="card">
+          <h2>Scheduler</h2>
+          <dl class="facts-list">
+            <dt>Tick interval</dt><dd id="s-tick">-</dd>
+            <dt>Post times</dt><dd id="s-times">-</dd>
+            <dt>Minimum gap</dt><dd id="s-gap">-</dd>
+            <dt>Next slot</dt><dd id="s-next">-</dd>
+            <dt>Last tick</dt><dd id="s-last">-</dd>
+            <dt>Last summary</dt><dd id="s-summary">-</dd>
+          </dl>
+          <div class="row">
+            <button class="btn" id="tick-now" type="button">Run one tick now</button>
+            <button class="btn" id="tick-dry" type="button">Dry run</button>
+            <span class="muted small" id="tick-status"></span>
+          </div>
+          <div id="tick-result" class="tick-result" hidden></div>
+        </section>
+        <section class="card">
+          <div class="card-head"><h2>Recent activity</h2><span class="muted small" id="activity-updated"></span></div>
+          <p class="empty" id="activity-empty">No activity yet.</p>
+          <ul class="activity" id="activity-list"></ul>
+          <details class="log-file-box"><summary>Log file tail</summary><pre id="activity-file" class="log-file"></pre></details>
+        </section>
+      </div>
+    </section>
+
+    <!-- ================= Settings ================= -->
+    <section class="panel" id="tab-settings" role="tabpanel" aria-labelledby="tabbtn-settings" hidden>
+      <header class="panel-head"><h1>Settings</h1></header>
+      <section class="card">
+        <div class="card-head"><h2>Environment check</h2><button class="btn" id="doctor-run" type="button">Run environment check</button></div>
+        <p class="muted small" id="doctor-status">Checks ffmpeg, yt-dlp, fonts, whisper, credentials and the workspace. This can take a few seconds.</p>
+        <div class="table-wrap">
+          <table id="doctor-table" hidden>
+            <thead><tr><th scope="col">Check</th><th scope="col">Status</th><th scope="col">Detail</th></tr></thead>
+            <tbody id="doctor-body"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="card">
+        <div class="card-head"><h2>Configuration</h2><code class="small break" id="settings-path"></code></div>
+        <p class="muted small" id="settings-note"></p>
+        <textarea id="settings-yaml" class="yaml" rows="24" spellcheck="false" aria-label="clipforge.yaml contents"></textarea>
+        <div class="row">
+          <button class="btn btn-primary" id="settings-save" type="button">Save</button>
+          <button class="btn" id="settings-reload" type="button">Reload from disk</button>
+          <span class="muted small" id="settings-dirty"></span>
+        </div>
+        <pre class="form-error" id="settings-error" role="alert" hidden></pre>
+      </section>
+      <section class="card">
+        <h2>Credentials</h2>
+        <p class="muted">
+          YouTube: save the OAuth client file from your Google Cloud project as <code>client_secret.json</code> in the workspace folder
+          (platforms.youtube.client_secret), then press Connect YouTube on the Publish tab.
+          TikTok: set client_key, client_secret and redirect_uri under platforms.tiktok in the YAML above, then press Connect TikTok.
+          Tokens are written to youtube_token.json and tiktok_token.json inside the workspace; nothing leaves this machine except the platform API calls.
+        </p>
+      </section>
+    </section>
+
+    <footer class="footer">
+      <span><span class="muted">workspace</span> <code id="workspace-path">-</code></span>
+      <span><span class="muted">config</span> <code id="config-path">-</code></span>
+    </footer>
+  </main>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<dialog id="confirm-dialog" aria-labelledby="confirm-text">
+  <form method="dialog">
+    <p id="confirm-text"></p>
+    <div class="dialog-actions">
+      <button class="btn" value="cancel" type="submit">Cancel</button>
+      <button class="btn btn-danger" id="confirm-ok" value="ok" type="submit">Confirm</button>
+    </div>
+  </form>
+</dialog>
+
+<dialog id="manual-dialog" aria-labelledby="manual-title">
+  <div class="dialog-head">
+    <h2 id="manual-title">Manual post</h2>
+    <button class="btn btn-ghost" id="manual-close" type="button" aria-label="Close">&#x2715;</button>
+  </div>
+  <p class="muted small" id="manual-clip"></p>
+  <label for="manual-caption">Caption to paste on the upload page</label>
+  <textarea id="manual-caption" rows="8" readonly spellcheck="false"></textarea>
+  <div class="row">
+    <button class="btn" id="manual-copy" type="button">Copy caption</button>
+    <a class="btn" id="manual-upload" href="#" target="_blank" rel="noopener noreferrer">Open upload page</a>
+    <a class="btn" id="manual-download" href="#" download>Download clip</a>
+  </div>
+  <form id="manual-form" class="field">
+    <label for="manual-post-id">Post URL or id (after uploading)</label>
+    <div class="row">
+      <input id="manual-post-id" type="text" required spellcheck="false" placeholder="URL or id of the published post">
+      <button class="btn btn-primary" type="submit">Mark as posted</button>
+    </div>
+  </form>
+  <pre class="form-error" id="manual-error" role="alert" hidden></pre>
+</dialog>
+
+<script src="/static/app.js" defer></script>
+</body>
+</html>

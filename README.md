@@ -19,6 +19,7 @@ clipforge run                                        # ingest → transcribe →
 clipforge review                                     # table + workspace/review.html with <video> previews
 clipforge review --approve-all                       # or export decisions.json from the page: review --apply decisions.json
 clipforge publish --to youtube --now --manual        # works with zero credentials
+clipforge ui                                         # or do all of the above in a browser at http://127.0.0.1:8765
 ```
 
 Real video:
@@ -32,6 +33,27 @@ Everything is cached under `workspace/<video_id>/` (download, captions, transcri
 command on the same video is instant. `workspace/clipforge.db` (SQLite) holds the state: `videos`
 (queued → downloaded → transcribed → selected → done), `clips` (candidate → rendered → ready → posted), `posts`
 (one row per clip × platform, unique once posted), `budget` (YouTube quota units per day) and `log`.
+
+## Web UI
+
+```bash
+clipforge ui                 # serves http://127.0.0.1:8765 and opens it in your browser
+clipforge ui --no-browser --port 9000
+```
+
+A local single-page app over the same engine, no accounts, no internet needed for the page itself:
+
+| Tab | What you do there |
+| --- | --- |
+| Dashboard | paste a URL or local path with the clip options, run the queue, watch video status and job progress |
+| Review | watch every clip, approve / reject (keys A / R), edit title, description and hashtags |
+| Publish | connect YouTube (Google sign-in opens on this machine) or TikTok (paste the redirect URL back into the page), publish selected clips, or use the manual dialog: copy caption, open the upload page, download the clip, mark as posted |
+| Schedule | start/stop the scheduler inside the UI process, see next slots and limits, run a tick or a dry run, recent activity log |
+| Settings | environment check (doctor) and a validated editor for `clipforge.yaml` |
+
+The server binds to 127.0.0.1 only, refuses requests from other origins or hosts (so a web page you visit cannot
+drive it), and disables the API docs page (it would load assets from a CDN). Everything the UI does is also available
+from the CLI; both share the same workspace and SQLite state, so you can mix them freely.
 
 ## What `run` does
 
@@ -60,6 +82,7 @@ succeeds), AAC 128 kbps, `+faststart`. No logos, watermarks or promo text are ev
 | `clipforge doctor` | environment + credential checks; exit 1 on a hard failure |
 | `clipforge fixture out.mp4 --seconds 120` | synthetic demo video with caption sidecar |
 | `clipforge init-config [--path clipforge.yaml] [--force]` | write a fully commented config |
+| `clipforge ui [--host 127.0.0.1] [--port 8765] [--no-browser]` | local web UI over the same engine |
 | global | `--config PATH`, `--verbose`, `--version` |
 
 ## Configuration — `clipforge.yaml`

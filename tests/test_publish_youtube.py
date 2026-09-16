@@ -465,6 +465,46 @@ def test_auth_flow_failure_reports_false(publisher: YouTubePublisher, monkeypatc
     assert "sign-in failed" in capsys.readouterr().out
 
 
+def test_run_flow_pins_the_url_bounds_the_wait_and_survives_a_missing_browser(publisher: YouTubePublisher, monkeypatch, yt_log):
+    """The sign-in URL is computed (and handed out) before the browser is opened, its state/PKCE verifier are reused by the
+    library's own run_local_server, the wait is bounded, and a machine without a browser only logs a warning."""
+    import webbrowser
+
+    import google_auth_oauthlib.flow as flow_mod
+
+    calls: dict = {}
+
+    class FakeFlow:
+        redirect_uri = None
+        autogenerate_code_verifier = True
+
+        def authorization_url(self, **kw):
+            calls["auth"] = dict(kw)
+            return f"https://accounts.example/o/oauth2/auth?redirect_uri={self.redirect_uri}&state=STATE1", "STATE1"
+
+        def run_local_server(self, **kw):
+            calls["run"] = dict(kw)
+            assert self.autogenerate_code_verifier is False  # a second authorization_url() must keep the verifier
+            return FakeCreds(valid=True, refresh_token="fresh")
+
+    flow = FakeFlow()
+    monkeypatch.setattr(flow_mod.InstalledAppFlow, "from_client_secrets_file", classmethod(lambda cls, path, scopes: flow))
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0, autoraise=True: (_ for _ in ()).throw(webbrowser.Error("could not locate runnable browser")))
+    monkeypatch.delenv(yt.NO_BROWSER_ENV, raising=False)
+    publisher.client_secret_path.write_text("{}", encoding="utf-8")
+    shown: list[str] = []
+    publisher.on_auth_url = shown.append
+    assert publisher.auth() is True and publisher.token_path.is_file()
+    port = int(flow.redirect_uri.rsplit(":", 1)[1].rstrip("/"))
+    assert flow.redirect_uri == f"http://localhost:{port}/" and 0 < port < 65536
+    assert shown == [f"https://accounts.example/o/oauth2/auth?redirect_uri={flow.redirect_uri}&state=STATE1"]
+    run = calls["run"]
+    assert run["port"] == port and run["open_browser"] is False and run["state"] == "STATE1" and run["prompt"] == "consent"
+    assert run["timeout_seconds"] == yt.FLOW_TIMEOUT_S == 600 and run["authorization_prompt_message"] is None
+    assert calls["auth"] == {"prompt": "consent"}
+    assert any("could not open a browser" in r.getMessage() for r in yt_log.records)
+
+
 def test_open_browser_env(monkeypatch):
     monkeypatch.delenv(yt.NO_BROWSER_ENV, raising=False)
     assert yt.open_browser_allowed()

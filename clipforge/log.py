@@ -13,7 +13,11 @@ _configured = False
 
 
 def setup_logging(log_dir: str | Path | None = None, level: int = logging.INFO) -> None:
-    """Idempotent. Console handler via rich; file handler at <log_dir>/clipforge.log if log_dir is given."""
+    """Idempotent. Console handler via rich; file handler at <log_dir>/clipforge.log if log_dir is given.
+
+    Only one file handler ever exists: calling this again with another `log_dir` (the UI reloading a saved config)
+    closes the previous file instead of writing every line to both.
+    """
     global _configured
     root = logging.getLogger("clipforge")
     if not _configured:
@@ -26,10 +30,13 @@ def setup_logging(log_dir: str | Path | None = None, level: int = logging.INFO) 
     if log_dir is not None:
         log_dir = Path(log_dir)
         log_dir.mkdir(parents=True, exist_ok=True)
-        target = log_dir / "clipforge.log"
-        for h in root.handlers:
-            if isinstance(h, logging.handlers.RotatingFileHandler) and Path(h.baseFilename) == target.resolve():
-                return
+        target = (log_dir / "clipforge.log").resolve()
+        for h in list(root.handlers):
+            if isinstance(h, logging.handlers.RotatingFileHandler):
+                if Path(h.baseFilename).resolve() == target:
+                    return
+                root.removeHandler(h)
+                h.close()
         fh = logging.handlers.RotatingFileHandler(target, maxBytes=2_000_000, backupCount=3, encoding="utf-8")
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))

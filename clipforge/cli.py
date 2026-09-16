@@ -601,5 +601,19 @@ def init_config(
     console.print(f"wrote {escape(str(path))}")
 
 
+# ---- ui ----------------------------------------------------------------------
+@app.command()
+def ui(
+    ctx: typer.Context,
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address. Keep the default: the UI has no login."),
+    port: int = typer.Option(8765, "--port", min=1, max=65535, help="TCP port."),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the browser."),
+) -> None:
+    """Local web UI: queue videos, watch runs, review clips, edit metadata, publish, run the scheduler."""
+    from .ui import main as ui_main
+
+    ui_main(_settings(ctx), host=host, port=port, open_browser=not no_browser)
+
+
 if __name__ == "__main__":
     app()
