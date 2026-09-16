@@ -1,7 +1,7 @@
 """Typer CLI. Commands: add, run, review, publish, daemon, tick, auth, doctor, fixture, init-config.
 
 Thin by design: every command maps arguments onto one module call and prints the result with rich. Expected errors
-end in `typer.Exit` with a code (2 = usage, 1 = failure, 3 = not available in this phase); no tracebacks.
+end in `typer.Exit` with a code (2 = usage, 1 = failure); no tracebacks.
 """
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ import threading
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 import typer
 from rich.markup import escape
@@ -22,16 +22,17 @@ from rich.table import Table
 from . import __version__
 from . import ffmpeg as F
 from .config import CONFIG_ENV, Settings, example_yaml, get_settings
-from .db import DB
+from .db import DB, Clip
 from .log import console, setup_logging
+
+if TYPE_CHECKING:
+    from .publish.base import Publisher
 
 app = typer.Typer(name="clipforge", help="Long-form video -> captioned vertical clips -> YouTube Shorts / TikTok. Local and free.", no_args_is_help=True)
 
 EXIT_FAILED = 1
 EXIT_USAGE = 2
-EXIT_NOT_YET = 3
-PHASE2_MESSAGE = "publishing arrives in Phase 2"
-PHASE3_MESSAGE = "the scheduler arrives in Phase 3"
+PUBLISHABLE_STATUSES = ("rendered", "ready", "posted")  # --clip-id accepts these; posts table guards each platform
 SKIP_WHISPER_ENV = "CLIPFORGE_TEST_SKIP_WHISPER"
 WHISPER_DOWNLOAD_WAIT_S = 20.0
 MIN_FREE_GB = 5.0
@@ -50,11 +51,6 @@ class Layout(str, Enum):
 def _fail(message: str, code: int = EXIT_FAILED) -> None:
     console.print(f"[red]error:[/] {escape(message)}")
     raise typer.Exit(code)
-
-
-def _not_yet(message: str) -> None:
-    console.print(escape(message))
-    raise typer.Exit(EXIT_NOT_YET)
 
 
 def _settings(ctx: typer.Context) -> Settings:
@@ -221,7 +217,89 @@ def review(
         console.print(f"review page: {escape(str(out))}")
 
 
-# ---- publish / auth (Phase 2) ------------------------------------------------
+# ---- publish / auth ----------------------------------------------------------
+@dataclass
+class PublishOutcome:
+    clip_id: str
+    platform: str
+    state: str  # posted | already posted | failed earlier | error
+    detail: str  # post id, or the error message
+
+    @property
+    def colour(self) -> str:
+        return {"posted": "green", "error": "red"}.get(self.state, "yellow")
+
+
+def _clips_to_publish(db: DB, clip_id: str | None, platforms: list[str]) -> list[Clip]:
+    """The clip named by --clip-id (rendered, ready or posted), else every ready clip plus the posted ones that still
+    lack one of the requested platforms (`--to youtube` then `--to tiktok` must reach the same clips)."""
+    if clip_id is None:
+        posted = [c for c in db.list_clips(status="posted") if any(not db.is_posted(c.id, p) for p in platforms)]
+        return sorted(db.list_clips(status="ready") + posted, key=lambda c: (c.video_id, c.idx))
+    clip = db.get_clip(clip_id)
+    if clip is None:
+        _fail(f"unknown clip {clip_id}", EXIT_USAGE)
+    if clip.status not in PUBLISHABLE_STATUSES:
+        _fail(f"clip {clip_id} is {clip.status}, not ready; run `clipforge review --approve-all` (or --apply decisions.json) first")
+    return [clip]
+
+
+def _build_publishers(platforms: list[str], settings: Settings, db: DB, *, manual: bool, browser: bool) -> dict[str, Publisher]:
+    """One authenticated publisher per platform; any that cannot authenticate stops the command before a single post."""
+    from . import publish as P
+
+    publishers: dict[str, Publisher] = {}
+    for name in platforms:
+        try:
+            publisher = P.get_publisher(name, settings, db, manual=manual, browser=browser)
+        except ValueError as e:
+            _fail(str(e), EXIT_USAGE)
+        except ImportError as e:
+            _fail(f"{name}: {e}")
+        if not publisher.auth():
+            _fail(f"{name}: not authenticated; run `clipforge auth {name}` or post with --manual")
+        publishers[name] = publisher
+    return publishers
+
+
+def _publish_all(settings: Settings, db: DB, publishers: dict[str, Publisher], clips: list[Clip], *, retry_failed: bool) -> list[PublishOutcome]:
+    """Every (clip, platform) pair once: already-posted pairs are reported, failures recorded and reported, never raised.
+
+    A pair the scheduler gave up on (post row `failed`) is only retried when the clip was named explicitly.
+    """
+    from . import scheduler
+    from .publish.base import PublishError
+
+    outcomes: list[PublishOutcome] = []
+    active = list(publishers)
+    for clip in clips:
+        for name, publisher in publishers.items():
+            post = db.get_post(clip.id, name)
+            if post is not None and post.status == "posted":
+                outcomes.append(PublishOutcome(clip.id, name, "already posted", post.post_id or ""))
+                continue
+            if post is not None and post.status == "failed" and not retry_failed:
+                outcomes.append(PublishOutcome(clip.id, name, "failed earlier", f"{post.error or ''} (retry with --clip-id {clip.id})".strip()))
+                continue
+            try:
+                post_id = scheduler.publish_clip(settings, db, publisher, clip, active, source="publish")
+            except PublishError as e:
+                outcomes.append(PublishOutcome(clip.id, name, "error", str(e)))
+                continue
+            outcomes.append(PublishOutcome(clip.id, name, "posted", post_id))
+    return outcomes
+
+
+def _print_publish_table(outcomes: list[PublishOutcome]) -> None:
+    table = Table(title="publish summary", expand=False)
+    table.add_column("clip", no_wrap=True)
+    table.add_column("platform", no_wrap=True)
+    table.add_column("result", overflow="fold")
+    for o in outcomes:
+        table.add_row(escape(o.clip_id), escape(o.platform), f"[{o.colour}]{o.state}[/] {escape(o.detail)}")
+    console.print(table)
+
+
 @app.command()
 def publish(
     ctx: typer.Context,
@@ -231,27 +309,28 @@ def publish(
     clip_id: str | None = typer.Option(None, "--clip-id", help="Post only this clip."),
     accept_risk: bool = typer.Option(False, "--i-accept-the-risk", help="Enable browser automation (opt-in; may breach platform terms)."),
 ) -> None:
-    """Post ready clips to YouTube Shorts and/or TikTok."""
-    from . import publish as P
+    """Post ready clips to YouTube Shorts and/or TikTok (API, --manual clipboard + browser, or opt-in automation)."""
+    from .publish import PLATFORMS
 
     settings = _settings(ctx)
     db = _open_db(settings)
     platforms = _platforms(to)
-    ready = [db.get_clip(clip_id)] if clip_id else db.list_clips(status="ready")
-    if clip_id and ready[0] is None:
-        _fail(f"unknown clip {clip_id}", EXIT_USAGE)
+    unknown = [p for p in platforms if p not in PLATFORMS]
+    if unknown:
+        _fail(f"unknown platform(s) {', '.join(unknown)}; choose from {', '.join(PLATFORMS)}", EXIT_USAGE)
+    clips = _clips_to_publish(db, clip_id, platforms)
     if not now:
-        console.print(f"{len(ready)} ready clip(s) left for the scheduler (clipforge daemon / tick) on {', '.join(platforms)}")
+        ready = sum(c.status == "ready" for c in clips)
+        console.print(f"{ready} ready clip(s) left for the scheduler (clipforge daemon / tick) on {', '.join(platforms)}")
         return
-    try:
-        for name in platforms:
-            publisher = P.get_publisher(name, settings, db, manual=manual, browser=accept_risk)
-            publisher.auth()
-            publisher.limits()
-    except ValueError as e:
-        _fail(str(e), EXIT_USAGE)
-    except (NotImplementedError, ImportError):
-        _not_yet(PHASE2_MESSAGE)
+    if not clips:
+        console.print("nothing to publish: no ready clips (clipforge review --approve-all marks rendered clips ready)")
+        return
+    publishers = _build_publishers(platforms, settings, db, manual=manual, browser=accept_risk)
+    outcomes = _publish_all(settings, db, publishers, clips, retry_failed=clip_id is not None)
+    _print_publish_table(outcomes)
+    if not any(o.state == "posted" for o in outcomes) and any(o.state == "error" for o in outcomes):
+        raise typer.Exit(EXIT_FAILED)
 
 
 @app.command()
@@ -261,40 +340,40 @@ def auth(ctx: typer.Context, platform: str = typer.Argument(..., help="youtube o
 
     settings = _settings(ctx)
     try:
-        ok = P.get_publisher(platform.lower(), settings, _open_db(settings)).auth()
+        publisher = P.get_publisher(platform.lower(), settings, _open_db(settings))
     except ValueError as e:
         _fail(str(e), EXIT_USAGE)
-    except NotImplementedError:
-        _not_yet(PHASE2_MESSAGE)
-    if not ok:
-        _fail(f"{platform}: authentication failed")
+    if not publisher.auth():
+        _fail(f"{platform}: authentication failed (see the messages above)")
     console.print(f"{escape(platform)}: authenticated")
 
 
-# ---- daemon / tick (Phase 3) -------------------------------------------------
+# ---- daemon / tick -----------------------------------------------------------
 @app.command()
 def tick(ctx: typer.Context, dry_run: bool = typer.Option(False, "--dry-run", help="Report what would be posted without posting.")) -> None:
-    """One scheduler pass (for cron / Task Scheduler): process the queue, then post what is due."""
+    """One scheduler pass (for cron / Task Scheduler): process the queue, then post what is due. -v lists skip reasons."""
     from . import scheduler
 
     settings = _settings(ctx)
-    try:
-        result = scheduler.tick(settings, _open_db(settings), dry_run=dry_run)
-    except NotImplementedError:
-        _not_yet(PHASE3_MESSAGE)
-    console.print(escape(str(result)))
+    result = scheduler.tick(settings, _open_db(settings), dry_run=dry_run)
+    console.print(escape(result.summary()), highlight=False)
+    if ctx.find_root().params.get("verbose"):
+        for reason in result.skipped:
+            console.print(f"  skipped: {escape(reason)}", highlight=False)
+    for error in result.errors:
+        console.print(f"  [red]error:[/] {escape(error)}", highlight=False)
 
 
 @app.command()
-def daemon(ctx: typer.Context) -> None:
-    """Scheduler loop: tick every schedule.tick_s seconds until interrupted."""
+def daemon(
+    ctx: typer.Context,
+    ticks: int | None = typer.Option(None, "--ticks", min=1, hidden=True, help="Stop after this many ticks (tests)."),
+) -> None:
+    """Scheduler loop: tick every schedule.tick_s seconds until Ctrl-C."""
     from . import scheduler
 
     settings = _settings(ctx)
-    try:
-        scheduler.daemon(settings, _open_db(settings))
-    except NotImplementedError:
-        _not_yet(PHASE3_MESSAGE)
+    scheduler.daemon(settings, _open_db(settings), ticks=ticks)
 
 
 # ---- doctor ------------------------------------------------------------------
@@ -419,12 +498,21 @@ def _check_ytdlp(settings: Settings) -> list[Check]:
     return [Check("yt-dlp", "WARN", f"yt-dlp {version}: no enabled JS runtime found (deno/node/bun; YouTube formats may be missing or throttled)")]
 
 
+def _token_check(platform: str, token: Path) -> Check:
+    """File-existence only (no network): the saved OAuth token `clipforge auth <platform>` writes."""
+    if token.is_file():
+        return Check(f"{platform} token", "OK", str(token))
+    return Check(f"{platform} token", "WARN", f"{token} not found: run `clipforge auth {platform}` (only needed for API publishing)")
+
+
 def _check_credentials(settings: Settings) -> list[Check]:
     yt = settings.platform_path(settings.platforms.youtube.client_secret)
     tiktok_key = settings.platforms.tiktok.client_key
     return [
         Check("youtube client_secret", "OK", str(yt)) if yt.is_file() else Check("youtube client_secret", "WARN", f"{yt} not found (only needed for API publishing; --manual works without it)"),
+        _token_check("youtube", settings.platform_path(settings.platforms.youtube.token_file)),
         Check("tiktok client_key", "OK", "set") if tiktok_key else Check("tiktok client_key", "WARN", "not set (platforms.tiktok.client_key; --manual works without it)"),
+        _token_check("tiktok", settings.platform_path(settings.platforms.tiktok.token_file)),
     ]
 
 

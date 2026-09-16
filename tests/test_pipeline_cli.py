@@ -2,8 +2,9 @@
 
 The CLI tests run the real pipeline end to end on the 40 s fixture through typer's CliRunner, in one shared temp
 workspace (module fixture `cli`): add -> run -> run again (instant) -> review -> doctor -> fixture -> init-config ->
-Phase 2/3 placeholders. They are written in execution order and build on each other's state. The pipeline unit tests
-replace the stages with fakes so the orchestration logic (force, skip, failure handling) runs without ffmpeg.
+publish/auth/tick/daemon without credentials. They are written in execution order and build on each other's state.
+The pipeline unit tests replace the stages with fakes so the orchestration logic (force, skip, failure handling) runs
+without ffmpeg.
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ from typer.testing import CliRunner
 
 from clipforge import pipeline
 from clipforge import ffmpeg as F
-from clipforge.cli import EXIT_NOT_YET, EXIT_USAGE, PHASE2_MESSAGE, PHASE3_MESSAGE, app
+from clipforge.cli import EXIT_FAILED, EXIT_USAGE, app
 from clipforge.download import Ingested, video_id_for
 from clipforge.metadata import read_meta
 from clipforge.render import RenderResult
@@ -165,18 +166,22 @@ def test_init_config_refuses_to_overwrite(cli: Cli):
     assert cli("init-config", "--path", str(path), "--force").exit_code == 0
 
 
-def test_phase_placeholders(cli: Cli):
+def test_publish_and_scheduler_without_credentials(cli: Cli):
+    """No client secret / token in this workspace: API publishing must explain itself, the scheduler must skip, no network."""
     res = cli("publish", "--to", "youtube", "--now")
-    assert res.exit_code == EXIT_NOT_YET and PHASE2_MESSAGE in res.output
-    assert cli("publish", "--to", "tiktok", "--now", "--manual").exit_code == EXIT_NOT_YET
+    assert res.exit_code == EXIT_FAILED, res.output
+    assert "clipforge auth youtube" in res.output or "--manual" in res.output
     assert cli("publish", "--to", "myspace", "--now").exit_code == EXIT_USAGE
     scheduled = cli("publish", "--to", "youtube")
     assert scheduled.exit_code == 0 and "left for the scheduler" in scheduled.output
-    for args in (("tick",), ("daemon",)):
-        res = cli(*args)
-        assert res.exit_code == EXIT_NOT_YET and PHASE3_MESSAGE in res.output
     res = cli("auth", "youtube")
-    assert res.exit_code == EXIT_NOT_YET and PHASE2_MESSAGE in res.output
+    assert res.exit_code == EXIT_FAILED and "authentication failed" in res.output
+    res = cli("-v", "tick", "--dry-run")
+    assert res.exit_code == 0 and "tick: processed 0 video(s), would post 0" in res.output, res.output
+    assert "youtube: not configured" in res.output and "tiktok: not configured" in res.output
+    res = cli("daemon", "--ticks", "1")
+    assert res.exit_code == 0 and "clipforge daemon" in res.output and "tick: processed 0" in res.output, res.output
+    assert cli.db.list_posts() == []
 
 
 def test_cli_survives_non_utf8_stdout(tmp_path: Path):
