@@ -4,7 +4,7 @@ Turn long-form YouTube videos (or local files) into captioned, vertical, fast-pa
 YouTube Shorts and/or TikTok. Local, CPU-only, $0 runtime, CLI-first, idempotent.
 
 ```
-clipforge add <url|file> → run → review → publish   (or: daemon / tick for hands-off scheduling)
+clipforge add <url|file>  →  run  →  review  →  publish        (or: daemon / tick for hands-off scheduling)
 ```
 
 ## 5-minute quickstart
@@ -12,162 +12,242 @@ clipforge add <url|file> → run → review → publish   (or: daemon / tick for
 ```bash
 python -m venv .venv && . .venv/bin/activate        # Windows: .venv\Scripts\activate
 pip install -e ".[dev]"
-clipforge doctor                                     # ffmpeg, yt-dlp, fonts, whisper model, credentials, NVENC, disk
-clipforge fixture demo.mp4 --seconds 120             # synthetic 2-minute video + caption sidecar (no network)
-clipforge add demo.mp4 --count 3                     # queue it (per-video options are remembered)
-clipforge run                                        # ingest → transcribe → select → render → metadata
-clipforge review                                     # table + workspace/review.html with previews
-clipforge review --approve-all                       # or: export decisions.json from the page, then --apply
-clipforge publish --to youtube --now --manual        # manual path works without any credentials
+clipforge doctor                                     # ffmpeg, fonts, whisper model, yt-dlp, credentials, NVENC, disk
+clipforge fixture demo.mp4 --seconds 120             # synthetic 2-minute video + caption sidecar (no network needed)
+clipforge add demo.mp4 --count 3 --tighten --punch   # queue it; per-video options are remembered
+clipforge run                                        # ingest → transcribe → select → render → metadata  (~15 s)
+clipforge review                                     # table + workspace/review.html with <video> previews
+clipforge review --approve-all                       # or export decisions.json from the page: review --apply decisions.json
+clipforge publish --to youtube --now --manual        # works with zero credentials
 ```
 
 Real video:
 
 ```bash
 clipforge add "https://www.youtube.com/watch?v=VIDEO_ID" --count 5 --min 20 --max 58 --style hormozi --tighten
-clipforge run
+clipforge run && clipforge review
 ```
 
-Everything is cached under `workspace/<video_id>/` (download, captions, transcript, candidates, clips). Re-running any
-command on the same video is instant. `clipforge.db` (SQLite, in the workspace) holds the state machine:
-`videos` (queued → downloaded → transcribed → selected → done) and `clips` (candidate → rendered → ready → posted).
+Everything is cached under `workspace/<video_id>/` (download, captions, transcript, candidates, clips). Re-running a
+command on the same video is instant. `workspace/clipforge.db` (SQLite) holds the state: `videos`
+(queued → downloaded → transcribed → selected → done), `clips` (candidate → rendered → ready → posted), `posts`
+(one row per clip × platform, unique once posted), `budget` (YouTube quota units per day) and `log`.
 
-## What happens in `run`
+## What `run` does
 
 | Stage | Module | Default (free) path | Notes |
 | --- | --- | --- | --- |
-| Ingest | `download.py` | yt-dlp, best mp4 ≤ 1080p, YouTube auto-captions as `json3` | local files are referenced, never copied; `<file>.en.json3` next to a local file is used as captions |
-| Transcribe | `transcribe.py` | json3 → word timestamps (instant) | no captions → faster-whisper (`base` on CPU, int8; `distil-large-v3` on NVIDIA, which needs `nvidia-cublas-cu12` + `nvidia-cudnn-cu12`; when CUDA is unusable it falls back to the CPU model); `--force-whisper` to skip captions |
-| Select | `select.py` | heuristic scorer (hook, TF-IDF distinctiveness, audio energy, speech-rate variance, completeness, filler, overlap) | `selector.mode: llm` uses any OpenAI-compatible endpoint, one call per video, hard fallback to heuristic |
-| Render | `render.py` + `captions.py` | one ffmpeg command per clip, process pool, only the selected segments are decoded | 9:16 crop (or `--layout blur`), karaoke `.ass` captions, hook card, progress bar, loudnorm −14 LUFS |
-| Metadata | `metadata.py` | title ≤ 100 chars, description, 3–6 hashtags per platform | `clips/<clip_id>.json` beside the mp4 |
+| Ingest | `download.py` | yt-dlp, best mp4 ≤ `download.max_height` (1080), YouTube auto-captions as `json3` | local files are referenced, never copied; a `<stem>.<lang>.json3` next to a local file is used as its captions |
+| Transcribe | `transcribe.py` | json3 → word timestamps (instant) | no captions or `--force-whisper` → faster-whisper (`base`/int8 on CPU, `distil-large-v3`/float16 on NVIDIA, CPU fallback if CUDA libs are missing) |
+| Select | `select.py` | heuristic scorer: hook strength, TF-IDF distinctiveness, audio-energy z-score, speech-rate variance, completeness, filler density; count-aware non-max suppression | `selector.mode: llm` → one call to any OpenAI-compatible endpoint (Ollama, Groq, Gemini), strict JSON, hard fallback to heuristic |
+| Render | `render.py` + `captions.py` | one ffmpeg command per clip in a process pool; only the selected segments are decoded (`-ss` before `-i`) | 9:16 crop (`--smart` face tracking) or `--layout blur`; karaoke `.ass` captions; hook card; progress bar; `--tighten` silence removal with re-mapped word times; `--punch` zoom; loudnorm −14 LUFS; optional music bed |
+| Metadata | `metadata.py` | title ≤ 100 chars, description, 3–6 hashtags per platform (`#shorts` / `#fyp` + topic tags) | `clips/<clip_id>.json` beside the mp4; LLM when `selector.mode: llm` |
 
-## Configuration — `clipforge.yaml`
-
-`clipforge init-config` writes a fully commented file with every default. Any key can be overridden with an
-environment variable: `CLIPFORGE_<SECTION>__<KEY>` (e.g. `CLIPFORGE_WHISPER__MODEL=small`,
-`CLIPFORGE_SELECTOR__MODE=llm`). `--config path.yaml` or `CLIPFORGE_CONFIG` selects another file.
-
-```yaml
-whisper: {model: auto, device: auto, compute_type: auto}   # auto → base/int8 on CPU, distil-large-v3/float16 on NVIDIA
-clips: {count: 5, min_s: 20, max_s: 58}
-style: hormozi            # hormozi | clean | minimal   (override any preset under `styles:`)
-layout: crop              # crop | blur
-tighten: false            # silence removal (gaps > 0.35 s, 80 ms kept)
-punch: false              # 1.08× zoom on hook words
-smart: false              # face-tracked crop (OpenCV Haar cascade)
-music: {enabled: false, file: "", gain_db: -22}   # royalty-free files you drop into assets/music/
-selector: {mode: heuristic, llm_base_url: http://localhost:11434/v1, llm_model: llama3.1, llm_api_key: ollama}
-platforms:
-  youtube: {privacy: private, category: "22", per_day: 3, upload_cost: 1600, daily_quota: 10000, publish_at: null}
-  tiktok:  {privacy: SELF_ONLY, per_day: 2, client_key: "", client_secret: "", redirect_uri: ""}
-schedule: {times: ["09:00", "13:00", "18:00"], min_gap_h: 2}
-paths: {workspace: workspace, db: "", logs: logs, assets: ""}
-render: {preset: veryfast, crf: 22, encoder: auto, workers: 0}
-```
+Output: 1080×1920, 30 fps, `libx264 -preset veryfast -crf 22` (`h264_nvenc` automatically when a probe encode
+succeeds), AAC 128 kbps, `+faststart`. No logos, watermarks or promo text are ever burned in.
 
 ## Commands
 
-| Command | What it does |
+| Command | Options |
 | --- | --- |
-| `add <url\|path> [--count N --min S --max S --style hormozi --layout crop --tighten --smart --punch --force-whisper --music]` | queue a video; options are stored per video; never queues the same video twice |
-| `run [--video-id ID] [--force]` | process the queue end-to-end; `--force` re-selects and re-renders |
-| `review [--html PATH] [--apply decisions.json] [--approve-all] [--video-id ID]` | table + `review.html`; approved clips become `ready` |
-| `publish [--to youtube,tiktok] [--now \| --schedule] [--manual] [--clip-id ID]` | post `ready` clips; `--schedule` just leaves them for the daemon |
-| `daemon` / `tick` | scheduler loop (60 s tick) / one-shot for cron & Task Scheduler |
-| `auth youtube\|tiktok` | interactive OAuth, tokens saved in the workspace |
-| `doctor` | environment + credentials check |
-| `fixture out.mp4 [--seconds N]` | synthetic demo video with a caption sidecar |
-| `init-config` | write `clipforge.yaml` |
+| `clipforge add <url\|path>` | `--count 5 --min 20 --max 58 --style hormozi --layout crop\|blur --tighten --smart --punch --force-whisper --music` (stored per video; the same video is never queued twice) |
+| `clipforge run` | `--video-id ID`, `--force` (re-select + re-render one video) |
+| `clipforge review` | `--html PATH`, `--apply decisions.json`, `--approve-all`, `--video-id ID`, `--no-html` |
+| `clipforge publish` | `--to youtube,tiktok`, `--now` / `--schedule` (default: leave for the daemon), `--manual`, `--clip-id ID`, `--i-accept-the-risk` |
+| `clipforge auth youtube\|tiktok` | interactive OAuth; tokens land in the workspace |
+| `clipforge tick` | one scheduler pass (`--dry-run`) for cron / Task Scheduler |
+| `clipforge daemon` | tick every `schedule.tick_s` seconds until Ctrl-C |
+| `clipforge doctor` | environment + credential checks; exit 1 on a hard failure |
+| `clipforge fixture out.mp4 --seconds 120` | synthetic demo video with caption sidecar |
+| `clipforge init-config [--path clipforge.yaml] [--force]` | write a fully commented config |
+| global | `--config PATH`, `--verbose`, `--version` |
+
+## Configuration — `clipforge.yaml`
+
+`clipforge init-config` writes every default with comments. Any key can be overridden by an environment variable
+`CLIPFORGE_<SECTION>__<KEY>` (e.g. `CLIPFORGE_WHISPER__MODEL=small`, `CLIPFORGE_SELECTOR__MODE=llm`,
+`CLIPFORGE_PLATFORMS__TIKTOK__CLIENT_KEY=…`). `--config path.yaml` or `CLIPFORGE_CONFIG` selects another file.
+
+```yaml
+whisper:   {model: auto, device: auto, compute_type: auto, language: null}   # auto → base/int8 CPU, distil-large-v3/float16 NVIDIA
+clips:     {count: 5, min_s: 20, max_s: 58, pad_s: 0.15}
+style:     hormozi            # hormozi | clean | minimal — override any field under `styles:` (font_size, accent_color, pos_y …)
+layout:    crop               # crop | blur
+tighten:   false              # silence removal: gaps > render.silence_min_s (0.35 s), render.silence_keep_s (80 ms) kept
+punch:     false              # 1.08× zoom for 0.3 s on hook words
+smart:     false              # face-tracked crop (OpenCV Haar cascade, 1 fps sampling, smoothed)
+music:     {enabled: false, file: "", gain_db: -22}   # royalty-free files you drop into assets/music/
+selector:  {mode: heuristic, llm_base_url: http://localhost:11434/v1, llm_model: llama3.1, llm_api_key: ollama}
+platforms:
+  youtube: {privacy: private, category: "22", per_day: 3, upload_cost: 1600, daily_quota: 10000, publish_at: null,
+            client_secret: client_secret.json, token_file: youtube_token.json, made_for_kids: false}
+  tiktok:  {privacy: SELF_ONLY, per_day: 2, client_key: "", client_secret: "", redirect_uri: "", token_file: tiktok_token.json}
+schedule:  {times: ["09:00", "13:00", "18:00"], min_gap_h: 2, tick_s: 60, backoff_base_s: 300, backoff_max_s: 21600, max_attempts: 5}
+paths:     {workspace: workspace, db: "", logs: logs, assets: ""}
+render:    {preset: veryfast, crf: 22, encoder: auto, workers: 0, fps: 30, width: 1080, height: 1920}
+download:  {max_height: 1080, caption_langs: [en], cookies_file: ""}
+```
+
+Relative `client_secret` / `token_file` names resolve inside `paths.workspace`.
 
 ## Credentials
 
-### YouTube (Data API v3) — exact console click-path
+### YouTube (Data API v3) — console click-path
 
-1. https://console.cloud.google.com → project selector → **New project** (any name) → select it.
+1. https://console.cloud.google.com → project selector → **New project** → select it.
 2. **APIs & Services → Library** → search **YouTube Data API v3** → **Enable**.
-3. **APIs & Services → OAuth consent screen** → User type **External** → fill app name + your email → **Save**.
-   Scopes: **Add or remove scopes** → tick `https://www.googleapis.com/auth/youtube.upload` → Save.
-   **Test users → Add users** → your Google account (the channel owner). Leave **Publishing status: Testing**.
+3. **APIs & Services → OAuth consent screen** → User type **External** → app name + your email → **Save**.
+   **Scopes → Add or remove scopes** → tick `https://www.googleapis.com/auth/youtube.upload` → Save.
+   **Test users → Add users** → the Google account that owns the channel. Leave **Publishing status: Testing**.
 4. **APIs & Services → Credentials → Create credentials → OAuth client ID** → Application type **Desktop app** →
-   Create → **Download JSON** → save it as `client_secret.json` in the project folder (or set
-   `platforms.youtube.client_secret`).
-5. `clipforge auth youtube` — a browser opens on Google's consent page (loopback redirect to `localhost`), the token is
-   saved to `workspace/youtube_token.json`.
+   Create → **Download JSON** → save it as `workspace/client_secret.json` (or point `platforms.youtube.client_secret`
+   at it).
+5. `clipforge auth youtube` — your browser opens Google's consent page (loopback redirect to `localhost`); the token is
+   saved to `workspace/youtube_token.json`. Headless box: `CLIPFORGE_NO_BROWSER=1 clipforge auth youtube` prints the
+   URL to open from another machine on the same host.
 
 Caveats you cannot configure away:
 
-* **Unverified API projects upload as private.** Until your project passes Google's YouTube API compliance audit
-  (https://support.google.com/youtube/contact/yt_api_form), every video uploaded through the API is locked to
-  `private`, whatever `privacyStatus` you send. ClipForge defaults to `private` and prints a one-time warning.
-* **Quota.** `videos.insert` costs `upload_cost` units (1600 at the time of writing) out of `daily_quota` (10 000
-  units/day default), resetting at midnight Pacific. That is ~6 uploads/day. ClipForge tracks the spend in SQLite and
-  refuses to upload once the budget is gone. Both numbers are config keys because Google changes them — verify at
-  https://developers.google.com/youtube/v3/determine_quota_cost.
-* **Testing-mode refresh tokens expire after 7 days.** Re-run `clipforge auth youtube` when `doctor` says the token
-  is invalid, or move the consent screen to *In production* (Google shows an "unverified app" screen but the token no
-  longer expires).
-* Shorts are just vertical videos ≤ 3 minutes; there is no special endpoint. `#shorts` goes into the description.
+* **Unverified API projects upload as private.** Until the project passes Google's YouTube API compliance audit
+  (https://support.google.com/youtube/contact/yt_api_form), every API upload is locked to `private`, whatever
+  `privacyStatus` you send. ClipForge defaults to `private` and prints a one-time warning.
+* **Quota.** `videos.insert` costs `platforms.youtube.upload_cost` units (1600 when this was written) out of
+  `daily_quota` (10 000 units/day by default), resetting at midnight Pacific — about 6 uploads a day. ClipForge counts the
+  spend in SQLite, refuses when the budget is gone and marks the day exhausted if Google answers `quotaExceeded`. Both
+  numbers are config keys because Google changes them; verify at https://developers.google.com/youtube/v3/determine_quota_cost.
+* **Testing-mode refresh tokens expire after 7 days.** Re-run `clipforge auth youtube` when `doctor` or a post says
+  the token is invalid, or move the consent screen to *In production* (an "unverified app" screen appears once, the token
+  then stops expiring).
+* Shorts are vertical videos ≤ 3 minutes; there is no special endpoint. `#shorts` goes into the description.
+* `publish_at` (scheduled publish) only works with `privacy: private`; write it as `2026-10-01T09:00` (local) or RFC 3339.
 
-### TikTok (Content Posting API) — exact click-path
+### TikTok (Content Posting API) — click-path
 
-1. https://developers.tiktok.com → **Manage apps → Connect an app** → name it → app type *Desktop* (or Web).
-2. **Add products**: **Login Kit** and **Content Posting API**. In Content Posting API enable **Direct Post**.
-3. **Scopes**: request `user.info.basic` and `video.publish` (Direct Post). `video.upload` is only needed for the
-   inbox/draft flow, which ClipForge does not use.
-4. **Login Kit → Redirect URI**: add any HTTPS URL you control (a GitHub Pages page, `https://localhost/callback`, …).
+1. https://developers.tiktok.com → **Manage apps → Connect an app** → name it (app type Desktop or Web).
+2. **Add products**: **Login Kit** and **Content Posting API**; inside Content Posting API enable **Direct Post**.
+3. **Scopes**: `user.info.basic` and `video.publish`.
+4. **Login Kit → Redirect URI**: any HTTPS URL you control (a GitHub Pages page, `https://localhost/callback`, …).
    ClipForge uses a *print-URL / paste-back* flow: it prints the authorize URL, you log in, TikTok redirects to your URI,
-   you paste the full redirected URL back into the terminal. No server is needed.
-5. Copy **Client key** and **Client secret** into `clipforge.yaml` (`platforms.tiktok.client_key/client_secret`) or
-   `CLIPFORGE_PLATFORMS__TIKTOK__CLIENT_KEY=…` / `…__CLIENT_SECRET=…`, set `redirect_uri` to the same URI, then
-   `clipforge auth tiktok`.
-6. **Sandbox first**: create a Sandbox in the app, add your TikTok account as a target user, and test there before
-   submitting the app for review.
+   you paste the full redirected URL back into the terminal. No server needed.
+5. Put **Client key** / **Client secret** / the redirect URI into `clipforge.yaml` (`platforms.tiktok.*`) or the
+   `CLIPFORGE_PLATFORMS__TIKTOK__CLIENT_KEY` / `…__CLIENT_SECRET` / `…__REDIRECT_URI` environment variables, then
+   `clipforge auth tiktok` (token → `workspace/tiktok_token.json`).
+6. **Sandbox first**: create a Sandbox in the app, add your TikTok account as a target user, test, then submit for review.
 
 Caveats you cannot configure away:
 
-* **Unaudited apps post `SELF_ONLY`, to private accounts only, for at most 5 users per 24 h.** Until TikTok's app
-  review passes, `creator_info/query` only offers `SELF_ONLY`, the posting account must be set to *private* in the
-  TikTok app, and posts are visible only to you. ClipForge always calls `creator_info/query` first and only sends a
-  `privacy_level` that endpoint returned (default `SELF_ONLY`).
-* Direct Post requires the app to show the creator's nickname and let the user pick privacy/interaction settings —
-  ClipForge prints them and applies the config values; `disable_duet/stitch/comment` follow the creator's settings.
+* **Unaudited apps post `SELF_ONLY`, to private accounts only, for at most 5 users per 24 h.** Until TikTok's review
+  passes, `creator_info/query` only offers `SELF_ONLY`, the posting account must be set to *private* in the TikTok app
+  and posts are visible only to you. ClipForge always queries `creator_info` first, prints the account it is about to
+  post to, and only sends a `privacy_level` that endpoint returned (default `SELF_ONLY`).
+* If the token exchange fails with an invalid `code_verifier`, flip `PKCE_CHALLENGE_ENCODING` in
+  `clipforge/publish/tiktok.py` from `"hex"` (TikTok's desktop sample) to `"base64url"` (RFC 7636); both are implemented.
 
 ### Manual (no credentials at all)
 
-`clipforge publish --to youtube --manual` (or `--to tiktok --manual`) copies the caption to the clipboard, prints the
-clip path, opens the platform's upload page in your browser, and marks the clip posted after you confirm. This is a
-first-class path, not a fallback: it is the fastest way to get the first clips out while the audits are pending.
+`clipforge publish --to youtube --now --manual` (or `--to tiktok`) copies the caption to the clipboard, prints it and
+the clip path, opens the platform's upload page, and marks the clip posted when you paste the post URL (or answer `y`).
+An empty answer leaves the clip `ready`. This is a first-class path, not a fallback: it is the fastest way to publish
+while the audits are pending. On bare Linux the clipboard needs `xclip`/`xsel`/`wl-copy`; without one the caption is
+just printed.
+
+### Browser automation (Phase 4, opt-in)
+
+`clipforge publish --now --i-accept-the-risk` drives YouTube Studio / TikTok upload pages with Playwright and a
+persistent logged-in profile (`workspace/browser_profile/<platform>`, treat it as a secret). It selects the file and
+fills the title/caption but **never presses Post itself** — you finish in the window and paste the URL back. This is
+brittle and against both platforms' terms on paper; install with `pip install "clipforge[browser]" && playwright install chromium`.
 
 ## Scheduler
 
-`clipforge daemon` runs a 60-second loop: process queued videos, then post `ready` clips at `schedule.times` (local
-time), at most `per_day` per platform, ≥ `min_gap_h` apart, honouring the YouTube quota budget. Failures back off
-exponentially (5 min → 6 h, 5 attempts). Everything is logged to SQLite (`log` table) and `logs/clipforge.log`.
-`clipforge tick` is the same logic as a one-shot for cron / Windows Task Scheduler:
+`clipforge daemon` loops every `schedule.tick_s` seconds: process queued videos, then post `ready` clips at
+`schedule.times` (local time; a missed slot is not back-filled), at most one clip per platform per tick, `per_day` per
+platform, ≥ `min_gap_h` apart, honouring the YouTube quota budget. Only platforms with credentials are used. Failures
+back off exponentially (`backoff_base_s · 2^attempts`, capped at `backoff_max_s`, `max_attempts` tries; non-retryable
+errors stop immediately). Every action is written to the SQLite `log` table and `logs/clipforge.log`.
+`clipforge tick` runs the same pass once:
 
 ```
-*/5 * * * *  cd /path/to/clipforge && .venv/bin/clipforge tick          # cron
-schtasks /Create /SC MINUTE /MO 5 /TN ClipForge /TR "C:\path\.venv\Scripts\clipforge.exe tick"   # Windows
+*/5 * * * *  cd /path/to/clipforge && .venv/bin/clipforge tick                                       # cron
+schtasks /Create /SC MINUTE /MO 5 /TN ClipForge /TR "C:\path\.venv\Scripts\clipforge.exe tick"      # Windows
 ```
 
 ## Tests
 
-`pytest` builds a 40-second synthetic fixture (SMPTE bars + gated tone + timecode) with a json3 caption sidecar and
-runs the whole pipeline on it in well under 60 s. No real YouTube video is ever touched. The single test that needs the
+`pytest` (≈ 360 tests, 15–50 s depending on the machine) builds a 40-second synthetic fixture (SMPTE bars + gated tone +
+timecode) with a json3 caption sidecar, runs the full pipeline on it through the CLI, and exercises both publishers and
+the scheduler against fake HTTP sessions and fake clocks. No real YouTube video, no network. The one test that needs the
 real whisper `tiny` model skips itself when the model cannot be downloaded.
 
 ## Assumptions and deviations (recorded as instructed)
 
-* **Hook card uses libass, not `drawtext`.** Static ffmpeg builds (imageio-ffmpeg, the fallback when no ffmpeg is on
-  PATH) are compiled without libharfbuzz, so `drawtext` does not exist there. The hook card is a styled, fading
-  Dialogue in the same `.ass` file as the captions. Same look, one code path, no extra dependency.
-* **ffprobe is optional.** imageio-ffmpeg ships only `ffmpeg`; `clipforge.ffmpeg.probe()` parses `ffmpeg -i` when no
-  ffprobe is found.
-* **Synthetic fixtures have no speech.** Word timestamps come from the generated json3 sidecar (the same path real
-  YouTube auto-captions take). The pipeline treats a `<stem>.<lang>.json3` file next to any local file as its captions.
+* **Hook card uses libass, not `drawtext`.** Static ffmpeg builds (imageio-ffmpeg, used when no ffmpeg is on PATH) lack
+  libharfbuzz, so `drawtext` does not exist there. The hook card is a fading styled Dialogue in the same `.ass` as the
+  captions: same look, one code path.
+* **ffprobe is optional.** imageio-ffmpeg ships only `ffmpeg`; `probe()` parses the `ffmpeg -i` header when ffprobe is
+  missing.
+* **Fixtures have no speech.** Word timestamps come from the generated json3 sidecar, the same path real YouTube
+  auto-captions take. Any local file with a `<stem>.<lang>.json3` sidecar takes that fast path too.
 * **Font.** Montserrat ExtraBold (SIL OFL 1.1, licence in `assets/Montserrat-OFL.txt`, kept out of `fonts/` because
-  libass tries to load every file in `fontsdir`) is bundled; nothing needs installing. `paths.assets` points a
-  non-editable install at a folder with `fonts/` and `music/`.
-* **Short videos.** When no window of `min_s..max_s` fits, the whole transcript becomes one candidate (if ≥ 5 s).
-* **Logs** go to `logs/` next to the workspace (configurable, gitignored).
+  libass tries to load every file in `fontsdir`) is bundled. Presets: hormozi 120 px, clean 100, minimal 84 (libass
+  sizes this font at ≈ 0.47 × size cap height). Captions sit at `pos_y` = 62 % of the height, centred at 44 % of the
+  width with groups ≤ 82 % wide, so nothing enters the bottom 20 % / right 15 % TikTok UI zone (the 6 px progress bar
+  is the only thing at the very bottom).
+* **Selection.** Windows are runs of sentences (split on terminal punctuation, pauses > 0.7 s or 30 words); overlap is a
+  hard non-max-suppression constraint; if the best-score pass leaves room, a growing length penalty is applied until the
+  requested count is reached. Videos shorter than `min_s` become one candidate (≥ 5 s). Scores are logistic-squashed
+  to (0, 1); the review table shows them.
+* **json3 conversion** caps a word at 1 s (YouTube's `dDurationMs` is a display duration, not speech), spreads
+  multi-word cues evenly, and merges `aAppend` continuation lines.
+* **Whisper** `auto` resolves to `base`/int8 on CPU and `distil-large-v3`/float16 when `nvidia-smi` works; if CUDA
+  libraries are missing (`nvidia-cublas-cu12`, `nvidia-cudnn-cu12`) it falls back to CPU automatically.
+* **Punch zoom** is implemented with `scale … eval=frame` + centred `crop`, because ffmpeg's `crop` evaluates its size
+  only once; verified frame-accurate on ffmpeg 7.0.
+* **Tighten** snaps cut boundaries to the frame grid so video and audio parts of every cut are equal; the effective
+  padding can be one frame larger than `clips.pad_s`.
+* **Audio**: single-pass `loudnorm`; sources without audio get a silent track. Music is mixed at a fixed `gain_db`
+  (no side-chain ducking).
+* **Caption/hook fonts** and the LLM prompt use ≤ 60-char hooks from the heuristic; LLM hooks may be up to 120 chars and
+  wrap to two lines.
+* **YouTube** counts quota when the upload completes; on `quotaExceeded` the day is marked exhausted so the scheduler
+  retries after the Pacific reset. Titles/descriptions have `<`/`>` stripped (the API rejects them).
+* **TikTok** posts use the caption as `title`, `video_cover_timestamp_ms: 1000`, and mirror the creator's
+  duet/comment/stitch settings; status is polled every 5 s for up to 10 min.
+* **Scheduler** posts the oldest ready clip first; a clip in backoff does not block the slot; a clip's status becomes
+  `posted` once every active platform has it; `publish --now` refuses to double-post and reports "already posted".
+* **Manual/browser** publishers do not enforce `per_day` (a human is in the loop) but report it in `limits()`.
+* **Logs** go to `logs/` (configurable, gitignored); the workspace is gitignored too.
+* **Layout.** Assets live in `assets/{fonts,music}` at the repo root (editable install). A non-editable install points
+  `paths.assets` at a folder containing `fonts/` and `music/`; `doctor` fails loudly when no font is found.
+
+## Run checklist
+
+```bash
+# 0. install + check
+python -m venv .venv && . .venv/bin/activate && pip install -e ".[dev]" && clipforge doctor && pytest
+
+# 1. YouTube credentials (once)
+#    console.cloud.google.com → New project → APIs & Services → Library → "YouTube Data API v3" → Enable
+#    → OAuth consent screen → External → add yourself under Test users → Scopes: youtube.upload
+#    → Credentials → Create credentials → OAuth client ID → Desktop app → Download JSON → workspace/client_secret.json
+clipforge auth youtube
+
+# 2. TikTok credentials (once)
+#    developers.tiktok.com → Manage apps → Connect an app → add Login Kit + Content Posting API (Direct Post)
+#    → scopes user.info.basic, video.publish → register a redirect URI → copy client key + secret → Sandbox first
+export CLIPFORGE_PLATFORMS__TIKTOK__CLIENT_KEY=... CLIPFORGE_PLATFORMS__TIKTOK__CLIENT_SECRET=... \
+       CLIPFORGE_PLATFORMS__TIKTOK__REDIRECT_URI=https://your.redirect/uri
+clipforge auth tiktok            # prints a URL; log in; paste the redirected URL back
+
+# 3. first real video
+clipforge add "https://www.youtube.com/watch?v=VIDEO_ID" --count 5 --min 20 --max 58 --style hormozi --tighten --punch
+clipforge run
+clipforge review                 # open workspace/review.html, export decisions.json → clipforge review --apply decisions.json
+clipforge publish --to youtube --now             # private upload, video id recorded in SQLite
+clipforge publish --to tiktok --now              # SELF_ONLY post
+clipforge publish --to youtube,tiktok --now --manual   # no-credentials path
+
+# 4. hands-off
+clipforge init-config            # edit schedule.times / per_day, then:
+clipforge daemon                 # or a cron / Task Scheduler entry running: clipforge tick
+```
