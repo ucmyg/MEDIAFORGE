@@ -17,4 +17,18 @@ done in-session. Full suite: `pytest` (444+ tests, ~31 s).
 - Not delivered: a signed one-file installer (PyInstaller/Inno). Packaging source only would need a Windows build
   host; the launcher meets the "no typed commands" requirement.
 
-## Next batch — 2: retry jitter + Retry-After, yt-dlp/UI timeouts, health endpoint
+## Batch 2 — retries, timeouts, health — DONE
+- Findings: fixed backoff without jitter and Retry-After ignored (youtube.py, tiktok.py); yt-dlp had no socket
+  timeout or retry setting so a stalled CDN could hang the single job worker; UI fetches had no client timeout; no
+  health endpoint.
+- Changes: equal jitter on in-process retries, Retry-After honoured (integer seconds, capped at 300 s, HTTP-date
+  ignored), 429 retried when hinted else surfaced as retry-later (`publish/youtube.py`, `publish/tiktok.py`);
+  `download.socket_timeout_s` (30 s) and `download.retries` (3) passed to yt-dlp (`config.py`, `download.py`);
+  `AbortController` timeouts in `app.js` (30 s default, 15 s poll, 90 s doctor) with a message that a timed-out
+  mutation may still have applied; `GET /api/health` liveness and `?ready=1` readiness returning booleans only
+  (`ui/server.py`), README section.
+- Verification: new tests (jitter window, Retry-After cap and HTTP-date, TikTok 503/429 hints, 429 without hint,
+  ydl opts, health 200/503, no path leak); affected files 158 passed; full suite below.
+- Not changed: scheduler `backoff_delay` stays deterministic (single process per workspace; tests pin exact values).
+
+## Next batch — 3: /api/state query batching, two indexes with EXPLAIN evidence, pagination

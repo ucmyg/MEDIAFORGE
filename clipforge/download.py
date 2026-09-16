@@ -193,6 +193,9 @@ def ydl_opts(video_dir: Path, settings: Settings) -> dict[str, Any]:
         "noprogress": True,
         "color": "never",
         "js_runtimes": {"deno": {}, "node": {}, "bun": {}},  # any installed supported runtime, not deno only
+        "socket_timeout": settings.download.socket_timeout_s,
+        "retries": settings.download.retries,
+        "fragment_retries": settings.download.retries,
     }
     if settings.download.cookies_file:
         opts["cookiefile"] = str(Path(settings.download.cookies_file).expanduser())

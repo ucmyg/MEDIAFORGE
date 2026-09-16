@@ -55,6 +55,10 @@ A local single-page app over the same engine, no accounts, no internet needed fo
 | Schedule | start/stop the scheduler inside the UI process, see next slots and limits, run a tick or a dry run, recent activity log |
 | Settings | environment check (doctor) and a validated editor for `clipforge.yaml` |
 
+`GET /api/health` answers `{status: ok}` for liveness; `GET /api/health?ready=1` also checks SQLite, ffmpeg and the
+workspace (503 `degraded` when one fails, booleans only). Point a local monitor at it if you run the daemon
+unattended; a check every 60 s or slower is plenty for a single-user tool.
+
 The server binds to 127.0.0.1 only, refuses requests from other origins or hosts (so a web page you visit cannot
 drive it), and disables the API docs page (it would load assets from a CDN). Everything the UI does is also available
 from the CLI; both share the same workspace and SQLite state, so you can mix them freely.

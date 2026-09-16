@@ -24,10 +24,11 @@ REDIRECT = "https://example.com/cb"
 
 
 class FakeResponse:
-    def __init__(self, status_code: int = 200, payload: dict | None = None):
+    def __init__(self, status_code: int = 200, payload: dict | None = None, headers: dict | None = None):
         self.status_code = status_code
         self._payload = payload
         self.text = json.dumps(payload) if payload is not None else ""
+        self.headers = headers or {}
 
     def json(self) -> dict:
         if self._payload is None:
@@ -147,6 +148,7 @@ def pub(settings, db):
     p.now_fn = lambda: 1_700_000_000.0
     p.sleeps = []
     p.sleep_fn = p.sleeps.append
+    tt._random = lambda: 1.0  # pin the equal jitter to the full base delay
     p.input_fn = lambda prompt: (_ for _ in ()).throw(AssertionError("input() must not be called"))
     write_token(p)
     p._session = FakeSession([])
@@ -635,3 +637,24 @@ def test_init_body_interactions_off_unless_enabled_and_disclosure_toggles():
     assert body["brand_organic_toggle"] is True and body["brand_content_toggle"] is False
     body = tt.init_body("c", "SELF_ONLY", {"comment_disabled": True}, 10, 10, 1, cfg)["post_info"]
     assert body["disable_comment"] is True  # the creator's own setting still wins
+
+
+# ---- hardening batch 2: jitter + Retry-After -----------------------------------------------------------------------
+def test_retry_after_and_jitter_on_requests(pub, clip, meta, db, monkeypatch):
+    monkeypatch.setattr(tt, "_random", lambda: 0.0)
+    pub._session = FakeSession([FakeResponse(503, headers={"Retry-After": "5"}), FakeResponse(429, headers={"Retry-After": "3"}), creator(), init_ok(), FakeResponse(206), FakeResponse(201), status("PUBLISH_COMPLETE", publicaly_available_post_id=["7"])])
+    assert pub.publish(clip, meta) == "7"
+    assert pub.sleeps[:2] == [5.0, 3.0]  # hints win over the 1.0 / 2.0 jittered bases
+
+
+def test_429_without_hint_is_a_retry_later_error(pub, clip, meta, db):
+    pub._session = FakeSession([api_error(429, "rate_limit_exceeded")])
+    with pytest.raises(PublishError) as ei:
+        pub.publish(clip, meta)
+    assert not isinstance(ei.value, PublishFatal) and pub.sleeps == []
+
+
+def test_retry_after_parsing():
+    assert tt._retry_after(FakeResponse(503, headers={"Retry-After": "600"})) == tt.RETRY_AFTER_MAX_S
+    assert tt._retry_after(FakeResponse(503, headers={"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})) is None
+    assert tt._retry_after(FakeResponse(503)) is None

@@ -20,6 +20,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import random
 import socket
 import time
 import webbrowser
@@ -55,8 +56,10 @@ TAGS_MAX_CHARS = 500  # snippet.tags: tag lengths plus one comma between tags; a
 FORBIDDEN_TEXT = str.maketrans("", "", "<>")  # title/description accept any UTF-8 except angle brackets
 DEFAULT_TITLE = "Clip"
 SHORTS_MAX_S = 180  # longer uploads are published as regular videos, not Shorts
-BACKOFF_S = (2, 4, 8, 16, 32)  # seconds slept before retry 1..5 of a transient chunk failure; then give up
-RETRY_STATUSES = frozenset({500, 502, 503, 504})  # HttpError statuses worth an in-process retry
+BACKOFF_S = (2, 4, 8, 16, 32)  # base seconds before retry 1..5 of a transient chunk failure (equal jitter applied); then give up
+RETRY_AFTER_MAX_S = 300  # a Retry-After header is honoured up to this many seconds
+_random = random.random  # module attribute so tests can pin the jitter
+RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})  # HttpError statuses worth an in-process retry (429 with its Retry-After)
 TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (OSError,)  # ConnectionError, TimeoutError, socket + requests errors
 QUOTA_REASONS = ("quotaExceeded", "uploadLimitExceeded")  # 4xx reasons (quotaExceeded is a 403, uploadLimitExceeded a 400) that mean "no more uploads today"
 ERROR_DETAIL_CHARS = 300
@@ -163,13 +166,36 @@ def _classify(err: BaseException) -> PublishError:
     return PublishError(f"youtube: upload failed ({detail})")
 
 
+def jittered(base: float) -> float:
+    """Equal jitter: half the base plus a random half, so retrying clients do not synchronise on an outage."""
+    return base / 2 + base / 2 * _random()
+
+
+def retry_after_s(err: BaseException) -> float | None:
+    """Seconds from a Retry-After header on an HttpError-like exception (integer form only), capped; None if absent."""
+    resp = getattr(err, "resp", None)
+    if resp is None or not hasattr(resp, "get"):
+        return None
+    try:
+        value = resp.get("retry-after")
+    except Exception:
+        return None
+    if value is None:
+        return None
+    try:
+        return min(float(int(str(value).strip())), float(RETRY_AFTER_MAX_S))
+    except ValueError:
+        return None  # HTTP-date form: fall back to our own backoff
+
+
 def _retry_or_raise(err: Exception, failures: int, sleep: Sleep) -> int:
     """Sleep and return failures+1 when `err` is transient and retries remain; otherwise raise the classified error."""
     if not _is_transient(err):
         raise _classify(err) from err
     if failures >= len(BACKOFF_S):
         raise PublishError(f"youtube: upload failed after {failures} retries ({_error_detail(err)})") from err
-    delay = BACKOFF_S[failures]
+    hinted = retry_after_s(err)
+    delay = hinted if hinted is not None else jittered(BACKOFF_S[failures])
     log.warning("youtube: transient upload error (%s); retry %d/%d in %ss", _error_detail(err), failures + 1, len(BACKOFF_S), delay)
     sleep(delay)
     return failures + 1

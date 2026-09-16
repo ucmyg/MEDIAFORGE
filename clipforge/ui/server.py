@@ -55,6 +55,7 @@ from starlette.staticfiles import NotModifiedResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from .. import __version__, config, download, pipeline
+from .. import ffmpeg as F
 from .. import publish as P
 from .. import scheduler as S
 from ..config import CONFIG_ENV, DEFAULT_CONFIG_FILE, DEFAULT_STYLES, Settings
@@ -842,6 +843,31 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one closure per rout
         return {"job_id": job.id}
 
     # ---- diagnostics -------------------------------------------------------------------------------------------------------------
+    @app.get("/api/health")
+    def health(ready: bool = False) -> JSONResponse:
+        """Liveness (default) or readiness (?ready=1: SQLite reachable, ffmpeg present, workspace writable).
+        Booleans only: no paths, versions of dependencies or configuration are exposed."""
+        if not ready:
+            return JSONResponse({"status": "ok", "version": __version__})
+        checks: dict[str, bool] = {}
+        try:
+            with st.db.connect() as c:
+                c.execute("SELECT 1").fetchone()
+            checks["db"] = True
+        except Exception:
+            checks["db"] = False
+        try:
+            checks["ffmpeg"] = Path(F.ffmpeg_exe()).is_file()
+        except Exception:
+            checks["ffmpeg"] = False
+        try:
+            ws = st.settings.workspace_dir
+            checks["workspace"] = ws.is_dir() and os.access(ws, os.W_OK)
+        except Exception:
+            checks["workspace"] = False
+        ok = all(checks.values())
+        return JSONResponse({"status": "ok" if ok else "degraded", "version": __version__, "checks": checks}, status_code=200 if ok else 503)
+
     @app.get("/api/doctor")
     def doctor() -> list[dict[str, str]]:
         from .. import cli  # lazy: cli imports typer/rich and this module

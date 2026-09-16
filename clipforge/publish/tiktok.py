@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import random
 import secrets
 import time
 from pathlib import Path
@@ -78,7 +79,9 @@ POST_ID_FIELD = "publicaly_available_post_id"  # sic - TikTok's field name
 # ---- transport
 HTTP_TIMEOUT_S = 60
 RETRY_ATTEMPTS = 3  # per request, on 5xx / connection errors
-RETRY_BACKOFF_S = 2.0  # sleep RETRY_BACKOFF_S * 2**(attempt-1) between attempts
+RETRY_BACKOFF_S = 2.0  # base for RETRY_BACKOFF_S * 2**(attempt-1) between attempts, with equal jitter
+RETRY_AFTER_MAX_S = 300  # honour Retry-After (integer seconds) up to this bound
+_random = random.random  # module attribute so tests can pin the jitter
 RATE_LIMIT_STATUS = 429
 # error.code values that mean "try again later" (verify: content-posting-api-reference-errors); every other non-ok
 # code (access_token_invalid, scope_not_authorized, invalid_params, spam_risk_*, ...) is fatal for this attempt.
@@ -255,6 +258,16 @@ def init_body(caption: str, privacy: str, creator: dict[str, Any], video_size: i
             "total_chunk_count": total_chunks,
         },
     }
+
+
+def _retry_after(resp: Any) -> float | None:
+    """Retry-After in integer seconds (capped) from a response; None when absent, unparsable or an HTTP-date."""
+    try:
+        headers = getattr(resp, "headers", None)
+        value = headers.get("Retry-After") if headers else None
+        return None if value is None else min(float(int(str(value).strip())), float(RETRY_AFTER_MAX_S))
+    except (ValueError, AttributeError, TypeError):
+        return None
 
 
 def api_data(resp: requests.Response, what: str) -> dict[str, Any]:
@@ -473,15 +486,21 @@ class TikTokPublisher(Publisher):
     def _request(self, method: str, url: str, what: str, **kw: Any) -> requests.Response:
         """One HTTP call, retried up to RETRY_ATTEMPTS times on 5xx / connection errors with exponential backoff."""
         last = ""
+        wait: float | None = None
         for attempt in range(1, RETRY_ATTEMPTS + 1):
             if attempt > 1:
-                self.sleep_fn(RETRY_BACKOFF_S * 2 ** (attempt - 2))
+                base = RETRY_BACKOFF_S * 2 ** (attempt - 2)
+                self.sleep_fn(wait if wait is not None else base / 2 + base / 2 * _random())  # Retry-After wins, else equal jitter
+            wait = None
             try:
                 resp = self._session.request(method, url, timeout=HTTP_TIMEOUT_S, **kw)
             except (requests.ConnectionError, requests.Timeout) as e:
                 last = f"{type(e).__name__}"
             else:
-                if resp.status_code < 500:
+                wait = _retry_after(resp)
+                if resp.status_code == 429 and wait is None:
+                    return resp  # no hint: api_data turns it into a retry-later PublishError for the scheduler
+                if resp.status_code < 500 and resp.status_code != 429:
                     return resp
                 last = f"HTTP {resp.status_code}"
             log.warning("tiktok %s: %s (attempt %d/%d)", what, last, attempt, RETRY_ATTEMPTS)

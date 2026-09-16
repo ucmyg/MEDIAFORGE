@@ -303,6 +303,7 @@ def test_ydl_opts(settings, tmp_path: Path) -> None:
     assert opts["quiet"] is True and opts["no_warnings"] is True and opts["noplaylist"] is True
     assert opts["logger"] is D.log and opts["noprogress"] is True and opts["color"] == "never"
     assert set(opts["js_runtimes"]) == {"deno", "node", "bun"}
+    assert opts["socket_timeout"] == 30.0 and opts["retries"] == 3 and opts["fragment_retries"] == 3  # a stalled CDN cannot hang the worker
     assert "cookiefile" not in opts
 
     settings.download.max_height = 720

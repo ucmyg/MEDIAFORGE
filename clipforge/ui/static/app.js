@@ -231,16 +231,23 @@
     }
     return `${res.status} ${res.statusText || ''}`.trim();
   }
-  async function api(method, path, body) {
+  const API_TIMEOUT_MS = 30000; // most calls answer in milliseconds; doctor and settings reloads get longer budgets
+  async function api(method, path, body, opts) {
     // X-ClipForge: the server refuses POST/PUT/DELETE without it, so a cross-site page cannot drive the API without a CORS preflight
-    const init = { method, headers: { Accept: 'application/json', 'X-ClipForge': '1' } };
+    const timeoutMs = (opts && opts.timeoutMs) || API_TIMEOUT_MS;
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeoutMs);
+    const init = { method, headers: { Accept: 'application/json', 'X-ClipForge': '1' }, signal: ctl.signal };
     if (body !== undefined) { init.headers['Content-Type'] = 'application/json'; init.body = JSON.stringify(body); }
     let res;
-    try { res = await fetch(path, init); } catch (_) {
-      const e = new Error('server unreachable');
+    try { res = await fetch(path, init); } catch (err) {
+      clearTimeout(timer);
+      // a timed-out mutation may still have been applied server-side: the next poll shows the truth
+      const e = new Error(err && err.name === 'AbortError' ? `no answer after ${Math.round(timeoutMs / 1000)} s` : 'server unreachable');
       e.network = true;
       throw e;
     }
+    clearTimeout(timer);
     const text = await res.text();
     let data = null;
     if (text) {
@@ -286,7 +293,7 @@
     S.polling = true;
     const gen = S.gen;
     try {
-      const state = await api('GET', '/api/state');
+      const state = await api('GET', '/api/state', undefined, { timeoutMs: 15000 });
       S.failing = false;
       setOffline(false);
       if (gen === S.gen) { S.state = normaliseState(state); render(); checkWatchers(); }
@@ -1198,7 +1205,7 @@
     btn.disabled = true;
     status.replaceChildren(h('span', { class: 'spinner', 'aria-hidden': 'true' }), ' Running checks\u2026');
     try {
-      const rows = await api('GET', '/api/doctor');
+      const rows = await api('GET', '/api/doctor', undefined, { timeoutMs: 90000 });
       const checks = Array.isArray(rows) ? rows : [];
       $('#doctor-body').replaceChildren(...checks.map((c) => h('tr', {},
         h('td', {}, c.name || ''), h('td', {}, pill(c.status || 'INFO')), h('td', { class: 'break' }, c.detail || ''))));

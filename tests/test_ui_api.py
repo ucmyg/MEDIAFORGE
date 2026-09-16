@@ -950,3 +950,17 @@ def test_tiktok_posting_choices_are_saved_to_the_config(api: TestClient, setting
     assert api.put("/api/platforms/tiktok", json={"bogus": 1}).status_code == 400
     assert api.put("/api/platforms/tiktok", json={"privacy": ""}).status_code == 200  # clearing the choice again
     assert api.get("/api/state").json()["settings"]["tiktok"]["privacy"] is None
+
+
+# ---- hardening batch 2: health ---------------------------------------------------------------------------------------
+def test_health_liveness_and_readiness(api: TestClient, monkeypatch):
+    live = api.get("/api/health")
+    assert live.status_code == 200 and live.json()["status"] == "ok" and set(live.json()) == {"status", "version"}
+    ready = api.get("/api/health", params={"ready": "1"})
+    assert ready.status_code == 200 and ready.json()["checks"] == {"db": True, "ffmpeg": True, "workspace": True}
+    from clipforge.ui import server as srv
+
+    monkeypatch.setattr(srv.F, "ffmpeg_exe", lambda: "/nonexistent/ffmpeg")
+    degraded = api.get("/api/health", params={"ready": "1"})
+    assert degraded.status_code == 503 and degraded.json()["status"] == "degraded" and degraded.json()["checks"]["ffmpeg"] is False
+    assert "/" not in json.dumps(degraded.json())  # no paths leak

@@ -27,6 +27,14 @@ FROZEN_TS = f"{FROZEN_DAY}T12:00:00+00:00"
 
 
 # ---- fakes -----------------------------------------------------------------------------------------------------------
+class HintedResp(dict):
+    """httplib2-style response: a dict of headers with a .status attribute."""
+
+    def __init__(self, status: int, retry_after: str):
+        super().__init__({"retry-after": retry_after})
+        self.status = status
+
+
 class FakeHttpError(Exception):
     """Shape of googleapiclient.errors.HttpError as seen by youtube._http_status / _error_detail."""
 
@@ -89,6 +97,7 @@ DONE = [(None, None), (None, {"id": "abc123"})]
 def publisher(settings, db: DB, monkeypatch) -> YouTubePublisher:
     monkeypatch.setattr(dbmod, "utcnow", lambda: FROZEN_TS)
     monkeypatch.setattr(YouTubePublisher, "today_key", lambda self: FROZEN_DAY)
+    monkeypatch.setattr(yt, "_random", lambda: 1.0)  # pin the jitter to the full base delay
     pub = YouTubePublisher(settings, db, sleep=lambda s: pub.sleeps.append(s))
     pub.sleeps = []
     return pub
@@ -542,3 +551,24 @@ def test_is_configured_cases(publisher: YouTubePublisher, settings):
     publisher.client_secret_path.parent.mkdir(parents=True)
     publisher.client_secret_path.write_text("{}", encoding="utf-8")
     assert not publisher.is_configured() and publisher.client_secret_path.is_absolute()  # secret alone: the daemon cannot post non-interactively
+
+
+# ---- hardening batch 2: jitter + Retry-After -----------------------------------------------------------------------
+def test_jitter_and_retry_after(publisher: YouTubePublisher, db: DB, clip: Clip, use_service, monkeypatch):
+    monkeypatch.setattr(yt, "_random", lambda: 0.0)  # lower edge of the equal-jitter window
+    hinted = FakeHttpError(429)
+    hinted.resp = HintedResp(429, "7")
+    svc = use_service([FakeHttpError(503), hinted, *DONE])
+    assert publisher.publish(clip, meta()) == "abc123"
+    assert publisher.sleeps == [1.0, 7.0]  # 2/2 + 0, then the Retry-After hint instead of the 4 s base
+    assert svc.request.calls == 4
+
+
+def test_retry_after_is_capped_and_http_dates_are_ignored():
+    long = FakeHttpError(503)
+    long.resp = HintedResp(503, "86400")
+    assert yt.retry_after_s(long) == yt.RETRY_AFTER_MAX_S
+    dated = FakeHttpError(503)
+    dated.resp = HintedResp(503, "Wed, 21 Oct 2026 07:28:00 GMT")
+    assert yt.retry_after_s(dated) is None and yt.retry_after_s(FakeHttpError(503)) is None
+    assert 1.0 <= yt.jittered(2) <= 2.0

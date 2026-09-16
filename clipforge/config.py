@@ -150,6 +150,8 @@ class DownloadCfg(BaseModel):
     max_height: int = 1080
     caption_langs: list[str] = Field(default_factory=lambda: ["en"])
     cookies_file: str = ""  # optional cookies.txt for yt-dlp
+    socket_timeout_s: float = 30.0  # yt-dlp per-connection timeout: a stalled CDN no longer hangs the pipeline
+    retries: int = 3  # yt-dlp retries per download / fragment
 
 
 class PathsCfg(BaseModel):
