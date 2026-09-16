@@ -3,15 +3,20 @@
 A tick (1) processes queued videos through the pipeline and (2) posts at most ONE ready clip per platform when a
 schedule slot is due. A slot (schedule.times, local wall-clock) is due once it has opened today and nothing was posted
 on that platform since it opened; missed slots collapse into one post (the daemon never "catches up" a backlog).
-Posting is further gated by schedule.min_gap_h since the platform's last post and by Publisher.limits() (per_day and
-the YouTube quota budget). Failures back off exponentially per (clip, platform) and give up after
-schedule.max_attempts; a permanently failed post never blocks the clip on other platforms.
+Posting is further gated by schedule.min_gap_h since the platform's last post, by Publisher.limits() (per_day and
+the YouTube quota budget) and by a non-interactive Publisher.credentials_ok() probe (unusable credentials are a
+platform skip, never a clip failure). Failures back off exponentially per (clip, platform) and give up after
+schedule.max_attempts; the platform itself cools down for the same window (kv `sched.<platform>.cooldown_until`) so a
+systemic failure costs one attempt per window instead of one clip per tick. A permanently failed post never blocks
+the clip on other platforms.
 
 Time handling: everything is an aware datetime. `now` is local (datetime.now().astimezone()); DB timestamps are UTC
 ISO strings (db.utcnow()) parsed with datetime.fromisoformat, which keeps them comparable with `now`.
 
-Every attempt lands in the posts table (ensure_post / mark_posted / mark_post_failed), the SQLite log table and the
-rotating log file. `publish_clip` is shared with `clipforge publish --now` so both paths record identically.
+Every attempt lands in the posts table (ensure_post / claim_post / mark_posted / mark_post_failed), the SQLite log
+table and the rotating log file. `publish_clip` is shared with `clipforge publish --now` so both paths record
+identically; the atomic claim (`uploading`) is what keeps the daemon and a concurrent `publish --now` from uploading
+the same clip twice.
 """
 from __future__ import annotations
 
@@ -27,13 +32,19 @@ from .db import DB, Clip
 from .log import console, get_logger
 from .metadata import ClipMeta, read_meta
 from .publish import PLATFORMS, get_publisher
-from .publish.base import Publisher, PublishFatal
+from .publish.base import AuthError, NotConfirmed, Publisher, PublishFatal
 
 log = get_logger(__name__)
 
 TIME_FORMAT = "%H:%M"  # schedule.times entries, local wall-clock
 DRY_RUN_POST_ID = ""  # post id recorded in TickResult.posted for a dry run (nothing was sent)
 LOG_ACTIONS = {"schedule": ("schedule.posted", "schedule.failed"), "publish": ("publish.posted", "publish.failed")}
+COOLDOWN_KEY = "sched.{platform}.cooldown_until"  # kv: platform-level backoff after any failure (UTC ISO)
+CLAIM_STALE = timedelta(hours=3)  # an `uploading` claim older than this belongs to a dead process and may be taken over
+
+
+class InProgress(RuntimeError):
+    """Another clipforge process holds the claim on this (clip, platform); nothing was attempted or recorded."""
 
 
 @dataclass
@@ -119,9 +130,14 @@ def tick(
     `publishers` injects Publisher instances by platform (tests); `platforms` restricts/orders the platforms and, when
     given explicitly, bypasses the is_configured() filter applied to the default list.
     """
-    now = _aware(now)
     result = TickResult(dry_run=dry_run)
-    _process_queue(settings, db, result)
+    if dry_run:  # "report what would be posted": the (possibly very long) pipeline step is reported, not run
+        pending = [v.id for v in db.list_videos() if v.status not in pipeline.TERMINAL_STATUSES]
+        if pending:
+            result.skipped.append(f"queue: would process {len(pending)} video(s) ({', '.join(pending)})")
+    else:
+        _process_queue(settings, db, result)
+    now = _aware(now)  # after the pipeline step so slot / min-gap / backoff use the current time
     try:
         times = parse_times(settings.schedule.times)
     except ValueError as err:
@@ -132,7 +148,11 @@ def tick(
     names = platforms or list(injected) or list(PLATFORMS)
     active = _active_publishers(settings, db, names, injected, check_configured=platforms is None, result=result)
     for publisher in active.values():
-        _tick_platform(settings, db, publisher, times, now, list(active), result)
+        try:
+            _tick_platform(settings, db, publisher, times, now, list(active), result)
+        except Exception as err:  # one publisher's crash (e.g. a missing tz database) must not stop the others
+            result.errors.append(f"{publisher.name}: tick failed: {type(err).__name__}: {err}")
+            log.error("%s: tick failed: %s: %s", publisher.name, type(err).__name__, err)
     return _finish(db, result)
 
 
@@ -194,6 +214,14 @@ def _tick_platform(settings: Settings, db: DB, publisher: Publisher, times: list
         note = f"; {limits.note}" if limits.note else ""
         result.skipped.append(f"{name}: slot {_hm(slot)} due but the daily allowance is exhausted ({limits.posted_today}/{limits.per_day} posted today{note})")
         return
+    cooldown = cooldown_until(db, name, now.tzinfo)
+    if cooldown is not None and cooldown > now:
+        result.skipped.append(f"{name}: slot {_hm(slot)} due but {name} is backing off until {_hm(cooldown)} after a failure")
+        return
+    if not publisher.credentials_ok():
+        result.skipped.append(f"{name}: slot {_hm(slot)} due but no usable credentials; run `clipforge auth {name}`")
+        log.error("%s: no usable credentials; run `clipforge auth %s`", name, name)
+        return
     clip, waiting = _pick_clip(db, name, now)
     if clip is None:
         result.skipped.append(f"{name}: slot {_hm(slot)} due but no ready clip to post" + (f" ({'; '.join(waiting)})" if waiting else ""))
@@ -204,10 +232,27 @@ def _tick_platform(settings: Settings, db: DB, publisher: Publisher, times: list
         return
     try:
         post_id = publish_clip(settings, db, publisher, clip, active, now=now)
+    except InProgress as err:
+        result.skipped.append(f"{name}: slot {_hm(slot)} due but {err}")
+        return
     except Exception as err:
         result.errors.append(_failure_message(settings, db, clip, name, err, now))
         return
     result.posted.append((clip.id, name, post_id))
+
+
+def cooldown_until(db: DB, platform: str, tz: tzinfo | None) -> datetime | None:
+    """End of the platform's backoff window set by the last failure (None when there is none)."""
+    raw = db.kv_get(COOLDOWN_KEY.format(platform=platform))
+    return _parse_ts(raw, tz) if raw else None
+
+
+def claim_is_live(post, now: datetime | None = None) -> bool:
+    """True when `post` is `uploading` under a claim younger than CLAIM_STALE (another process is posting it right now)."""
+    if post.status != "uploading" or not post.claimed_at:
+        return False
+    now = _aware(now)
+    return _parse_ts(post.claimed_at, now.tzinfo) > now - CLAIM_STALE
 
 
 def _no_slot_reason(now: datetime, times: list[time], last: datetime | None) -> str:
@@ -223,17 +268,23 @@ def _no_slot_reason(now: datetime, times: list[time], last: datetime | None) -> 
 
 
 def _pick_clip(db: DB, platform: str, now: datetime) -> tuple[Clip | None, list[str]]:
-    """Oldest ready clip not yet posted on `platform`, not permanently failed there and not waiting for a retry.
+    """Oldest ready-or-posted clip not yet posted on `platform`, not permanently failed there, not waiting for a retry
+    and not being posted by another process right now.
 
+    `posted` clips are included because a clip flips to `posted` once every *active* platform has it (e.g.
+    `publish --now --to youtube`, or while tiktok was unconfigured); the is_posted check keeps out the real ones.
     Also returns notes about clips that were passed over because they wait for a backoff or failed permanently.
     """
     notes: list[str] = []
-    for clip in sorted(db.list_clips(status="ready"), key=lambda c: c.created_at):
+    for clip in sorted(db.list_clips(status=["ready", "posted"]), key=lambda c: c.created_at):
         if db.is_posted(clip.id, platform):
             continue
         post = db.get_post(clip.id, platform)
         if post is None:
             return clip, notes
+        if claim_is_live(post, now):
+            notes.append(f"{clip.id} is being posted by another process")
+            continue
         if post.status == "failed":
             notes.append(f"{clip.id} failed permanently after {post.attempts} attempt(s)")
             continue
@@ -248,21 +299,39 @@ def _pick_clip(db: DB, platform: str, now: datetime) -> tuple[Clip | None, list[
 def publish_clip(settings: Settings, db: DB, publisher: Publisher, clip: Clip, active: Sequence[str], *, now: datetime | None = None, source: str = "schedule") -> str:
     """Post one clip through `publisher`, recording the attempt either way; returns the post id or re-raises.
 
-    An exhausted allowance raises PublishFatal before anything is recorded (nothing was attempted). Success verifies
-    the posted row (publishers mark it themselves; marked here otherwise) and flips the clip to `posted` once every
-    platform in `active` has it. Failures get attempts/backoff/final recorded (see _record_failure) and are re-raised.
+    An exhausted allowance raises PublishFatal before anything is recorded (nothing was attempted); a claim held by
+    another process raises InProgress likewise. Success verifies the posted row (publishers mark it themselves; marked
+    here otherwise) and flips the clip to `posted` once every platform in `active` has it. Failures get
+    attempts/backoff/final recorded (see _record_failure) and are re-raised. A NotConfirmed decline and an interrupt
+    (Ctrl-C, SIGTERM) record nothing: the claim is released (a row this call created is dropped again).
     """
     now = _aware(now)
     name = publisher.name
     publisher.ensure_allowance()
-    attempts_before = db.ensure_post(clip.id, name).attempts
+    row = db.ensure_post(clip.id, name)
+    attempts_before = row.attempts
+    if not db.claim_post(clip.id, name, _iso_utc(now), _iso_utc(now - CLAIM_STALE)):
+        raise InProgress(f"{name}: clip {clip.id} is being posted by another clipforge process")
     try:
         post_id = publisher.publish(clip, _load_meta(clip))
+    except NotConfirmed:  # a decline is not an attempt (manual.py contract): no attempts, no backoff, no row
+        _discard_attempt(db, row)
+        raise
     except Exception as err:
         _record_failure(settings, db, clip, name, err, now, attempts_before, source)
         raise
+    except BaseException:  # KeyboardInterrupt / SystemExit mid-upload: leave the row pending for the next run
+        db.release_claim(clip.id, name)
+        raise
     _record_success(db, clip, name, post_id, active, source)
     return post_id
+
+
+def _discard_attempt(db: DB, row) -> None:
+    """Drop the row when it never recorded an attempt (it was created for this call), else just hand back the claim."""
+    if row.attempts == 0 and db.delete_post(row.id):
+        return
+    db.release_claim(row.clip_id, row.platform)
 
 
 def _load_meta(clip: Clip) -> ClipMeta:
@@ -277,6 +346,7 @@ def _record_success(db: DB, clip: Clip, platform: str, post_id: str, active: Seq
     remaining = [p for p in active if not db.is_posted(clip.id, p)]
     if not remaining:
         db.set_clip_status(clip.id, "posted")
+    db.kv_delete(COOLDOWN_KEY.format(platform=platform))  # the platform works again
     db.log(LOG_ACTIONS[source][0], f"{clip.id} -> {platform} {post_id}" + (f" (still ready for {', '.join(remaining)})" if remaining else " (clip status -> posted)"))
     log.info("%s: posted %s -> %s", platform, clip.id, post_id)
 
@@ -287,8 +357,19 @@ def _record_failure(settings: Settings, db: DB, clip: Clip, platform: str, err: 
     Real publishers record their own failure via mark_post_failed (attempts + 1, next_attempt_at None, final for
     PublishFatal); then only the retry time/status is written here so an attempt is never counted twice, and the
     publisher's verdict on finality (e.g. YouTube quota exhaustion = retry tomorrow) is respected.
+
+    Whatever the verdict, the platform cools down until the retry time (also after a final failure, one window), so
+    a systemic failure tries one clip per window instead of a new clip every tick. An AuthError is not the clip's
+    fault: its row is left untouched (claim released) and only the platform cooldown and the logs record it.
     """
     sched = settings.schedule
+    if isinstance(err, AuthError):
+        db.release_claim(clip.id, platform)
+        delay = backoff_delay(attempts_before, sched.backoff_base_s, sched.backoff_max_s)
+        db.kv_set(COOLDOWN_KEY.format(platform=platform), _iso_utc(now + timedelta(seconds=delay)))
+        db.log(LOG_ACTIONS[source][1], f"{clip.id} -> {platform} not attempted (credentials unusable, clip left as is): {err}", level="error")
+        log.error("%s: %s not attempted, credentials unusable (run `clipforge auth %s`): %s", platform, clip.id, platform, err)
+        return
     row = db.get_post(clip.id, platform)
     if row is not None and row.attempts > attempts_before:  # the publisher recorded this failure itself
         attempts = row.attempts
@@ -299,6 +380,7 @@ def _record_failure(settings: Settings, db: DB, clip: Clip, platform: str, err: 
         final = isinstance(err, PublishFatal) or attempts >= sched.max_attempts
     delay = backoff_delay(attempts - 1, sched.backoff_base_s, sched.backoff_max_s)
     retry_at = now + timedelta(seconds=delay)
+    db.kv_set(COOLDOWN_KEY.format(platform=platform), _iso_utc(retry_at))
     if row is not None:
         _set_retry(db, row.id, None if final else _iso_utc(retry_at), final)
     else:
@@ -316,7 +398,7 @@ def _set_retry(db: DB, post_row_id: int, next_attempt_at: str | None, final: boo
 
 def _failure_message(settings: Settings, db: DB, clip: Clip, platform: str, err: BaseException, now: datetime) -> str:
     post = db.get_post(clip.id, platform)
-    if post is None:
+    if post is None or isinstance(err, AuthError):
         return f"{platform}: {clip.id} failed: {err}"
     if post.status == "failed":
         state = f"attempt {post.attempts}/{settings.schedule.max_attempts}, giving up"

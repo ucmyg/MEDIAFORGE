@@ -31,7 +31,7 @@ from ..config import Settings, YouTubeCfg
 from ..db import DB, Clip
 from ..log import console, get_logger
 from ..metadata import ClipMeta
-from .base import Limits, PublishError, Publisher, PublishFatal
+from .base import AuthError, Limits, PublishError, Publisher, PublishFatal
 
 if TYPE_CHECKING:
     from google.oauth2.credentials import Credentials
@@ -55,7 +55,7 @@ SHORTS_MAX_S = 180  # longer uploads are published as regular videos, not Shorts
 BACKOFF_S = (2, 4, 8, 16, 32)  # seconds slept before retry 1..5 of a transient chunk failure; then give up
 RETRY_STATUSES = frozenset({500, 502, 503, 504})  # HttpError statuses worth an in-process retry
 TRANSIENT_EXCEPTIONS: tuple[type[BaseException], ...] = (OSError,)  # ConnectionError, TimeoutError, socket + requests errors
-QUOTA_REASONS = ("quotaExceeded", "uploadLimitExceeded")  # 403 reasons that mean "no more uploads today"
+QUOTA_REASONS = ("quotaExceeded", "uploadLimitExceeded")  # 4xx reasons (quotaExceeded is a 403, uploadLimitExceeded a 400) that mean "no more uploads today"
 ERROR_DETAIL_CHARS = 300
 SETUP_STEPS = (
     "1. https://console.cloud.google.com/ -> create (or pick) a project",
@@ -144,10 +144,10 @@ def _classify(err: BaseException) -> PublishError:
     """Map a non-transient upload exception onto QuotaExhausted / PublishFatal / PublishError (retry later)."""
     status = _http_status(err)
     detail = _error_detail(err)
-    if status == 403 and any(reason in detail for reason in QUOTA_REASONS):
+    if status is not None and 400 <= status < 500 and any(reason in detail for reason in QUOTA_REASONS):
         return QuotaExhausted(f"youtube: no more uploads allowed today ({detail}); quota resets at midnight Pacific")
-    if status in (401, 403):
-        return PublishFatal(f"youtube: HTTP {status} ({detail}); run `clipforge auth youtube` to re-authorise")
+    if status in (401, 403):  # account-level (revoked token, no channel, missing scope), not a verdict on this clip
+        return AuthError(f"youtube: HTTP {status} ({detail}); run `clipforge auth youtube` to re-authorise")
     if status is not None and 400 <= status < 500 and status != 429:
         return PublishFatal(f"youtube: HTTP {status} rejected the upload ({detail})")
     return PublishError(f"youtube: upload failed ({detail})")
@@ -211,7 +211,11 @@ class YouTubePublisher(Publisher):
         return self.settings.platform_path(self.cfg.client_secret)
 
     def is_configured(self) -> bool:
-        return self.token_path.is_file() or self.client_secret_path.is_file()
+        """A stored token; the client secret alone still needs the interactive `clipforge auth youtube`."""
+        return self.token_path.is_file()
+
+    def credentials_ok(self) -> bool:
+        return self._usable_credentials() is not None
 
     # ---- auth ----------------------------------------------------------
     def auth(self, interactive: bool = True) -> bool:
@@ -294,10 +298,10 @@ class YouTubePublisher(Publisher):
         log.info("youtube: token saved to %s", path)
 
     def _service(self) -> Any:
-        """Authenticated Data API client (googleapiclient Resource). Non-interactive: raises PublishFatal without a token."""
+        """Authenticated Data API client (googleapiclient Resource). Non-interactive: raises AuthError without a token."""
         creds = self._usable_credentials()
         if creds is None:
-            raise PublishFatal("youtube: no usable credentials; run `clipforge auth youtube`")
+            raise AuthError("youtube: no usable credentials; run `clipforge auth youtube`")
         from googleapiclient.discovery import build
 
         return build("youtube", "v3", credentials=creds, cache_discovery=False)
@@ -353,6 +357,7 @@ class YouTubePublisher(Publisher):
                 self._mark_quota_exhausted(day)
             self._record_failure(clip, err)
             raise
+        log.info("youtube: upload complete, video id %s (%s)", video_id, clip.id)  # survives any failure below (Ctrl-C, busy DB)
         return self._record_success(clip, day, video_id, body["status"]["privacyStatus"])
 
     def _clip_file(self, clip: Clip) -> Path:
@@ -372,18 +377,27 @@ class YouTubePublisher(Publisher):
     def _record_failure(self, clip: Clip, err: PublishError) -> None:
         """Bump the post row's attempts with the error; final for PublishFatal except quota exhaustion (retry tomorrow).
 
+        An AuthError is the account's problem, not the clip's: the row is left untouched (only logged).
         next_attempt_at is left to the scheduler, which owns the backoff policy.
         """
-        final = isinstance(err, PublishFatal) and not isinstance(err, QuotaExhausted)
-        self.db.mark_post_failed(clip.id, self.name, str(err), next_attempt_at=None, final=final)
+        if not isinstance(err, AuthError):
+            final = isinstance(err, PublishFatal) and not isinstance(err, QuotaExhausted)
+            self.db.mark_post_failed(clip.id, self.name, str(err), next_attempt_at=None, final=final)
         self.db.log("publish.youtube", f"{clip.id}: {err}", level="error")
         log.error("youtube: %s failed: %s", clip.id, err)
 
     def _record_success(self, clip: Clip, day: str, video_id: str, privacy: str) -> str:
-        self.db.budget_add(self.name, day, self.cfg.upload_cost)
-        self.db.mark_posted(clip.id, self.name, video_id)
+        """mark_posted first: once the row is `posted` nothing can re-upload the video; the rest is best-effort bookkeeping."""
+        try:
+            self.db.mark_posted(clip.id, self.name, video_id)
+        except Exception as err:  # e.g. sqlite3.OperationalError on a busy DB: final, so the scheduler never re-uploads
+            raise PublishFatal(f"youtube: video {video_id} was uploaded but recording it failed ({type(err).__name__}: {err}); mark clip {clip.id} posted manually") from err
         url = SHORTS_URL.format(video_id=video_id)
-        self.db.log("publish.youtube", f"{clip.id} -> {video_id} ({privacy}) {url}")
+        try:
+            self.db.budget_add(self.name, day, self.cfg.upload_cost)
+            self.db.log("publish.youtube", f"{clip.id} -> {video_id} ({privacy}) {url}")
+        except Exception as err:  # the quota is at worst under-counted by one upload; quotaExceeded from the API still marks the day
+            log.error("youtube: %s is posted as %s but the bookkeeping failed (%s: %s)", clip.id, video_id, type(err).__name__, err)
         log.info("youtube: posted %s -> %s (%s)", clip.id, video_id, privacy)
         console.print(f"[green]youtube:[/] {escape(url)} ({privacy})", highlight=False)
         return video_id

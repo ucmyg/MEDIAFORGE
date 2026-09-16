@@ -20,7 +20,7 @@ from clipforge.metadata import ClipMeta
 from clipforge.publish import browser as br
 from clipforge.publish import get_publisher
 from clipforge.publish import manual as mn
-from clipforge.publish.base import PublishError, PublishFatal
+from clipforge.publish.base import NotConfirmed, PublishError, PublishFatal
 from clipforge.publish.browser import BrowserPublisher, PlaywrightDriver
 from clipforge.publish.manual import InteractivePublisher, ManualPublisher
 
@@ -186,7 +186,7 @@ def test_manual_empty_answer_is_not_confirmed(settings, db: DB, clip: Clip, clip
 
     for answer in ("", "   "):
         pub = manual("youtube", settings, db, answer)
-        with pytest.raises(PublishError, match="not confirmed"):
+        with pytest.raises(NotConfirmed, match="not confirmed"):  # a PublishError subclass the scheduler does not count
             pub.publish(clip, meta())
     pub = manual("youtube", settings, db)
     pub.input_fn = eof  # cron / redirected stdin
@@ -352,7 +352,7 @@ def test_browser_automation_failure_is_retryable(settings, db: DB, clip: Clip, c
     pub = browser("youtube", settings, db, drv)  # no answer scripted: the prompt must not be reached
     with pytest.raises(PublishError, match="automation failed") as info:
         pub.publish(clip, meta())
-    assert not isinstance(info.value, PublishFatal) and "--manual" in str(info.value)
+    assert isinstance(info.value, NotConfirmed) and not isinstance(info.value, PublishFatal) and "--manual" in str(info.value)
     assert drv.closed and drv.captions == [] and not db.is_posted(clip.id, "youtube")
     assert any(r["action"] == "publish.browser" and r["level"] == "error" and "set_file broke" in r["detail"] for r in db.recent_log())
 
@@ -371,6 +371,13 @@ def test_browser_auth_flow(settings, db: DB, capsys):
 
     pub.input_fn = eof
     assert pub.auth() is True  # no terminal: the profile may already be logged in
+    assert len(drv.opened) == 2
+
+    cookies = pub.profile_dir / "Default" / "Cookies"  # Chromium has used the profile: no second window, no keypress
+    cookies.parent.mkdir(parents=True)
+    cookies.write_bytes(b"")
+    pub.input_fn = lambda prompt: pytest.fail("no prompt for a used profile")
+    assert pub.profile_ready() and pub.auth() is True and len(drv.opened) == 2
 
 
 # ---- browser: PlaywrightDriver glue against a fake playwright module -------------------------------------------------------

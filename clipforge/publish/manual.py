@@ -4,9 +4,9 @@ This is the zero-credential path (`clipforge publish --now --manual`) and the fa
 for its audit. publish() flow: ensure_not_posted -> rendered file check -> warn_once (platform hints) -> caption ->
 clipboard (pyperclip, optional) -> webbrowser.open(upload page) -> ask for the post URL/id -> mark_posted.
 
-A decline (empty answer, or no terminal) raises PublishError("not confirmed") and only writes a log-table row: the
-posts table gets no pending/failed row, so the scheduler's attempt counter and backoff stay untouched and the clip
-is offered again next time. Nothing here enforces per_day: the human is in the loop; limits() still reports it.
+A decline (empty answer, or no terminal) raises NotConfirmed("not confirmed") and only writes a log-table row: the
+posts table gets no pending/failed row (scheduler.publish_clip drops the row it pre-created), so the attempt counter
+and backoff stay untouched and the clip is offered again next time. Nothing here enforces per_day: the human is in the loop; limits() still reports it.
 
 InteractivePublisher holds everything the Playwright publisher (browser.py) shares with this one: platform
 validation, caption text, the clipboard, the confirmation prompt and the success record.
@@ -27,7 +27,7 @@ from ..config import Settings, TikTokCfg, YouTubeCfg
 from ..db import DB, Clip
 from ..log import console, get_logger
 from ..metadata import ClipMeta
-from .base import Limits, PublishError, Publisher, PublishFatal
+from .base import Limits, NotConfirmed, Publisher, PublishFatal
 
 log = get_logger(__name__)
 
@@ -121,12 +121,12 @@ class InteractivePublisher(Publisher):
             return ""
 
     def confirm(self, clip: Clip) -> str:
-        """Ask whether the clip went up. Empty/whitespace -> PublishError('not confirmed'); a confirm word -> generated id."""
+        """Ask whether the clip went up. Empty/whitespace -> NotConfirmed('not confirmed'); a confirm word -> generated id."""
         answer = self.ask_posted().strip()
         if not answer:
             self.db.log(f"publish.{self.mode}", f"{self.name} {clip.id}: not confirmed", level="warning")
             log.warning("%s: %s not confirmed, left ready", self.name, clip.id)
-            raise PublishError("not confirmed")
+            raise NotConfirmed("not confirmed")
         return generated_post_id(self.mode) if answer.lower() in CONFIRM_WORDS else answer
 
     def record_posted(self, clip: Clip, post_id: str) -> str:

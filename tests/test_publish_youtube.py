@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 from datetime import timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,8 +17,9 @@ import pytest
 import clipforge.db as dbmod
 from clipforge.db import DB, Clip
 from clipforge.metadata import ClipMeta
+from clipforge.publish import base as pb
 from clipforge.publish import youtube as yt
-from clipforge.publish.base import PublishError, PublishFatal
+from clipforge.publish.base import AuthError, PublishError, PublishFatal
 from clipforge.publish.youtube import QuotaExhausted, YouTubePublisher
 
 FROZEN_DAY = "2026-09-15"
@@ -155,6 +157,37 @@ def test_limits_quota_bound_beats_per_day(publisher: YouTubePublisher):
     assert publisher.limits().remaining == 6  # 10000 // 1600
 
 
+def test_posted_today_counts_in_the_pacific_day(publisher: YouTubePublisher, settings, db: DB, monkeypatch):
+    """posted_at is UTC; between 17:00 and midnight Pacific the UTC date is already tomorrow, yet the post is today's."""
+    assert publisher.budget_tz().key == "America/Los_Angeles" and publisher.today_key() == FROZEN_DAY
+
+    def post_at(clip_id: str, iso_utc: str) -> None:
+        make_clip(settings, db, clip_id)
+        monkeypatch.setattr(dbmod, "utcnow", lambda: iso_utc)
+        db.mark_posted(clip_id, "youtube", f"id-{clip_id}")
+
+    post_at("vid_01", "2026-09-16T01:00:00+00:00")  # 15 Sep 18:00 PDT: the 18:00 slot of the frozen day
+    post_at("vid_02", "2026-09-16T06:30:00+00:00")  # 15 Sep 23:30 PDT: still the frozen day
+    post_at("vid_03", "2026-09-15T06:00:00+00:00")  # 14 Sep 23:00 PDT: yesterday, although the UTC date matches
+    assert publisher.posted_today() == 2 and publisher.limits().remaining == 1
+
+
+def test_pacific_tz_falls_back_without_tzdata(monkeypatch):
+    import zoneinfo
+
+    def missing(key):
+        raise zoneinfo.ZoneInfoNotFoundError(key)
+
+    pb.pacific_tz.cache_clear()
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(zoneinfo, "ZoneInfo", missing)
+            assert pb.pacific_tz().utcoffset(None) == timedelta(hours=-8)
+    finally:
+        pb.pacific_tz.cache_clear()
+    assert pb.pacific_tz().key == "America/Los_Angeles"
+
+
 # ---- publish ---------------------------------------------------------------------------------------------------------
 def test_publish_happy_path(publisher: YouTubePublisher, db: DB, clip: Clip, use_service, capsys):
     svc = use_service(DONE)
@@ -216,29 +249,35 @@ def test_quota_exceeded_marks_budget_exhausted(publisher: YouTubePublisher, db: 
     assert any(r["level"] == "error" and r["action"] == "publish.youtube" for r in db.recent_log())
 
 
-def test_upload_limit_exceeded_is_quota(publisher: YouTubePublisher, db: DB, clip: Clip, use_service):
-    use_service([api_error(403, "uploadLimitExceeded")])
+@pytest.mark.parametrize("status", [403, 400])  # the Data API returns uploadLimitExceeded as a 400 badRequest, quotaExceeded as a 403
+def test_upload_limit_exceeded_is_quota(publisher: YouTubePublisher, db: DB, clip: Clip, use_service, status):
+    use_service([api_error(status, "uploadLimitExceeded", "The user has exceeded the number of videos they may upload.")])
     with pytest.raises(QuotaExhausted):
         publisher.publish(clip, meta())
-    assert db.budget_used("youtube", FROZEN_DAY) == 10000
+    assert db.budget_used("youtube", FROZEN_DAY) == 10000 and publisher.limits().exhausted
+    assert db.get_post(clip.id, "youtube").status == "pending"  # retry after the Pacific reset, not a permanent failure
 
 
-@pytest.mark.parametrize(
-    "error, match",
-    [
-        (FakeHttpError(401, b"Invalid Credentials"), "clipforge auth youtube"),
-        (api_error(403, "forbidden", "The caller does not have permission"), "clipforge auth youtube"),
-        (api_error(400, "invalidTitle", "The request metadata specifies an invalid video title."), "invalidTitle: The request metadata"),
-    ],
-)
-def test_fatal_http_errors(publisher: YouTubePublisher, db: DB, clip: Clip, use_service, error, match):
-    use_service([error])
-    with pytest.raises(PublishFatal, match=match) as info:
+def test_fatal_http_error_is_final(publisher: YouTubePublisher, db: DB, clip: Clip, use_service):
+    use_service([api_error(400, "invalidTitle", "The request metadata specifies an invalid video title.")])
+    with pytest.raises(PublishFatal, match="invalidTitle: The request metadata") as info:
         publisher.publish(clip, meta())
-    assert not isinstance(info.value, QuotaExhausted)
+    assert not isinstance(info.value, (QuotaExhausted, AuthError))
     post = db.get_post(clip.id, "youtube")
     assert post.status == "failed" and post.attempts == 1
     assert db.budget_used("youtube", FROZEN_DAY) == 0
+
+
+@pytest.mark.parametrize("error", [FakeHttpError(401, b"Invalid Credentials"), api_error(403, "forbidden", "The caller does not have permission")])
+def test_auth_http_errors_leave_the_row_untouched(publisher: YouTubePublisher, db: DB, clip: Clip, use_service, error):
+    """401/403 are account-level: a platform problem must not turn into a permanent per-clip failure."""
+    use_service([error])
+    with pytest.raises(AuthError, match="clipforge auth youtube"):
+        publisher.publish(clip, meta())
+    post = db.get_post(clip.id, "youtube")
+    assert post.status == "pending" and post.attempts == 0 and post.next_attempt_at is None
+    assert db.budget_used("youtube", FROZEN_DAY) == 0
+    assert any(r["level"] == "error" and r["action"] == "publish.youtube" for r in db.recent_log())
 
 
 def test_other_http_error_is_retryable(publisher: YouTubePublisher, db: DB, clip: Clip, use_service):
@@ -250,9 +289,44 @@ def test_other_http_error_is_retryable(publisher: YouTubePublisher, db: DB, clip
 
 def test_publish_without_credentials_is_fatal(publisher: YouTubePublisher, db: DB, clip: Clip, monkeypatch):
     monkeypatch.setattr(YouTubePublisher, "_load_credentials", lambda self: None)
-    with pytest.raises(PublishFatal, match="clipforge auth youtube"):
+    assert publisher.credentials_ok() is False
+    with pytest.raises(AuthError, match="clipforge auth youtube"):
         publisher.publish(clip, meta())
-    assert db.get_post(clip.id, "youtube").status == "failed"
+    post = db.get_post(clip.id, "youtube")
+    assert post.status == "pending" and post.attempts == 0  # left for the next attempt after `clipforge auth youtube`
+
+
+def test_credentials_ok_probe(publisher: YouTubePublisher, monkeypatch):
+    monkeypatch.setattr(YouTubePublisher, "_load_credentials", lambda self: FakeCreds(valid=True))
+    assert publisher.credentials_ok() is True
+    monkeypatch.setattr(YouTubePublisher, "_load_credentials", lambda self: FakeCreds(valid=False, expired=True, refresh_token=None))
+    assert publisher.credentials_ok() is False
+
+
+def test_recording_failure_after_upload_is_fatal_and_names_the_video(publisher: YouTubePublisher, db: DB, clip: Clip, use_service, monkeypatch, yt_log):
+    """The video is on the channel once the last chunk is in: a DB error afterwards must never lead to a re-upload."""
+    use_service(DONE)
+
+    def busy(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "mark_posted", busy)
+    with yt_log.at_level(logging.INFO, logger=yt.log.name), pytest.raises(PublishFatal, match="video abc123 was uploaded but recording it failed") as info:
+        publisher.publish(clip, meta())
+    assert "database is locked" in str(info.value) and "mark clip vid_00 posted manually" in str(info.value)
+    assert any("upload complete, video id abc123" in r.getMessage() for r in yt_log.records)  # the id is in the log even so
+    assert db.budget_used("youtube", FROZEN_DAY) == 0 and not db.is_posted(clip.id, "youtube")
+
+
+def test_bookkeeping_failure_after_mark_posted_is_logged_not_raised(publisher: YouTubePublisher, db: DB, clip: Clip, use_service, monkeypatch):
+    use_service(DONE)
+
+    def busy(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "budget_add", busy)
+    assert publisher.publish(clip, meta()) == "abc123"
+    assert db.is_posted(clip.id, "youtube") and db.get_post(clip.id, "youtube").post_id == "abc123"
 
 
 def test_publish_missing_file_is_fatal(publisher: YouTubePublisher, db: DB, clip: Clip, use_service):
@@ -374,8 +448,10 @@ def test_auth_missing_client_secret_prints_instructions(publisher: YouTubePublis
 def test_auth_runs_flow_and_saves_token(publisher: YouTubePublisher, monkeypatch):
     publisher.client_secret_path.write_text('{"installed": {}}', encoding="utf-8")
     monkeypatch.setattr(YouTubePublisher, "_run_flow", lambda self: FakeCreds(valid=True, refresh_token="fresh"))
-    assert publisher.is_configured() and publisher.auth() is True
+    assert not publisher.is_configured()  # a client secret alone still needs the interactive flow
+    assert publisher.auth() is True
     assert publisher.token_path.is_file() and json.loads(publisher.token_path.read_text(encoding="utf-8"))["refresh_token"] == "fresh"
+    assert publisher.is_configured()
 
 
 def test_auth_flow_failure_reports_false(publisher: YouTubePublisher, monkeypatch, capsys):
@@ -418,7 +494,6 @@ def test_is_configured_cases(publisher: YouTubePublisher, settings):
     assert publisher.is_configured()
     publisher.token_path.unlink()
     settings.platforms.youtube.client_secret = str(settings.workspace_dir / "elsewhere" / "cs.json")
-    assert not publisher.is_configured()
     publisher.client_secret_path.parent.mkdir(parents=True)
     publisher.client_secret_path.write_text("{}", encoding="utf-8")
-    assert publisher.is_configured() and publisher.client_secret_path.is_absolute()
+    assert not publisher.is_configured() and publisher.client_secret_path.is_absolute()  # secret alone: the daemon cannot post non-interactively

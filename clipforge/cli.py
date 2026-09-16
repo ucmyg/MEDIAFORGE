@@ -222,7 +222,7 @@ def review(
 class PublishOutcome:
     clip_id: str
     platform: str
-    state: str  # posted | already posted | failed earlier | error
+    state: str  # posted | already posted | failed earlier | not confirmed | in progress | error
     detail: str  # post id, or the error message
 
     @property
@@ -257,7 +257,8 @@ def _build_publishers(platforms: list[str], settings: Settings, db: DB, *, manua
         except ImportError as e:
             _fail(f"{name}: {e}")
         if not publisher.auth():
-            _fail(f"{name}: not authenticated; run `clipforge auth {name}` or post with --manual")
+            hint = "install Playwright (see above) or post with --manual" if browser else f"run `clipforge auth {name}` or post with --manual"
+            _fail(f"{name}: not authenticated; {hint}")
         publishers[name] = publisher
     return publishers
 
@@ -265,10 +266,11 @@ def _build_publishers(platforms: list[str], settings: Settings, db: DB, *, manua
 def _publish_all(settings: Settings, db: DB, publishers: dict[str, Publisher], clips: list[Clip], *, retry_failed: bool) -> list[PublishOutcome]:
     """Every (clip, platform) pair once: already-posted pairs are reported, failures recorded and reported, never raised.
 
-    A pair the scheduler gave up on (post row `failed`) is only retried when the clip was named explicitly.
+    A pair the scheduler gave up on (post row `failed`) is only retried when the clip was named explicitly. A manual
+    decline ("not confirmed") and a clip another process is posting right now are reported, not counted as errors.
     """
     from . import scheduler
-    from .publish.base import PublishError
+    from .publish.base import NotConfirmed, PublishError
 
     outcomes: list[PublishOutcome] = []
     active = list(publishers)
@@ -283,8 +285,17 @@ def _publish_all(settings: Settings, db: DB, publishers: dict[str, Publisher], c
                 continue
             try:
                 post_id = scheduler.publish_clip(settings, db, publisher, clip, active, source="publish")
+            except NotConfirmed:
+                outcomes.append(PublishOutcome(clip.id, name, "not confirmed", "left ready; run again when it is posted"))
+                continue
+            except scheduler.InProgress as e:
+                outcomes.append(PublishOutcome(clip.id, name, "in progress", str(e)))
+                continue
             except PublishError as e:
                 outcomes.append(PublishOutcome(clip.id, name, "error", str(e)))
+                continue
+            except Exception as e:  # publish_clip already recorded it with backoff; report it like _tick_platform instead of a traceback
+                outcomes.append(PublishOutcome(clip.id, name, "error", f"{type(e).__name__}: {e}"))
                 continue
             outcomes.append(PublishOutcome(clip.id, name, "posted", post_id))
     return outcomes

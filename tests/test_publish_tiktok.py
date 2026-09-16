@@ -11,7 +11,7 @@ import pytest
 
 from clipforge.metadata import ClipMeta
 from clipforge.publish import tiktok as tt
-from clipforge.publish.base import PublishError, PublishFatal
+from clipforge.publish.base import AuthError, PublishError, PublishFatal
 from clipforge.publish.tiktok import TikTokPublisher
 
 MB = tt.MB
@@ -307,6 +307,45 @@ def test_poll_timeout_is_retryable(pub, clip, meta, db):
     assert not isinstance(ei.value, PublishFatal)
     assert len(pub.sleeps) == polls - 1 and all(s == tt.POLL_INTERVAL_S for s in pub.sleeps)
     assert db.get_post(clip.id, "tiktok").status == "pending"
+    assert db.kv_get(tt.PUBLISH_ID_KEY.format(clip_id=clip.id)) == "p1"  # the upload is complete: remembered for a resume
+
+
+def test_retry_after_poll_timeout_resumes_the_same_publish_id_without_reupload(pub, clip, meta, db):
+    """TikTok owns the video once every chunk is accepted; the next attempt must only poll, never init/upload again."""
+    polls = tt.POLL_TIMEOUT_S // tt.POLL_INTERVAL_S + 1
+    pub._session = FakeSession([creator(), init_ok("first"), FakeResponse(206), FakeResponse(201)] + [status("PROCESSING_UPLOAD")] * polls)
+    with pytest.raises(PublishError, match="first"):
+        pub.publish(clip, meta)
+
+    pub._session = FakeSession([status("PROCESSING_DOWNLOAD"), status("PUBLISH_COMPLETE", publicaly_available_post_id=["77"])])
+    assert pub.publish(clip, meta) == "77"
+    assert [(m, u, kw["json"]) for m, u, kw in pub._session.calls] == [("POST", tt.STATUS_URL, {"publish_id": "first"})] * 2
+    post = db.get_post(clip.id, "tiktok")
+    assert post.status == "posted" and post.post_id == "77" and post.attempts == 1
+    assert db.kv_get(tt.PUBLISH_ID_KEY.format(clip_id=clip.id)) is None
+
+    # a status/fetch transport failure after the upload keeps the id as well
+    db.add_video("vid2", "local", "b.mp4")
+    db.upsert_clip("vid2_00", "vid2", 0, 0.0, 1.0, 0.0, "")
+    db.update_clip("vid2_00", path=clip.path, status="ready")
+    other = db.get_clip("vid2_00")
+    pub._session = FakeSession([creator(), init_ok("second"), FakeResponse(206), FakeResponse(201), FakeResponse(500), FakeResponse(502), FakeResponse(503)])
+    with pytest.raises(PublishError, match="after 3 attempts"):
+        pub.publish(other, meta)
+    assert db.kv_get(tt.PUBLISH_ID_KEY.format(clip_id="vid2_00")) == "second"
+    pub._session = FakeSession([status("PUBLISH_COMPLETE")])
+    assert pub.publish(other, meta) == "second"
+
+
+def test_resumed_publish_that_failed_starts_over_next_time(pub, clip, meta, db):
+    db.kv_set(tt.PUBLISH_ID_KEY.format(clip_id=clip.id), "stale")
+    pub._session = FakeSession([status("FAILED", fail_reason="frame_rate_check_failed")])
+    with pytest.raises(PublishFatal, match="frame_rate_check_failed"):
+        pub.publish(clip, meta)
+    assert db.kv_get(tt.PUBLISH_ID_KEY.format(clip_id=clip.id)) is None and db.get_post(clip.id, "tiktok").status == "failed"
+    db.mark_post_failed(clip.id, "tiktok", "reset", None)
+    pub._session = FakeSession(HAPPY)  # fresh init + upload
+    assert pub.publish(clip, meta) == "7" and [u for _, u, _ in pub._session.calls].count(tt.INIT_URL) == 1
 
 
 def test_init_5xx_is_retried_then_succeeds(pub, clip, meta):
@@ -340,9 +379,11 @@ def test_chunk_upload_retries_on_5xx_and_rejects_bad_status(pub, clip, meta):
 
 def test_api_error_codes_map_to_fatal_or_retryable(pub, clip, meta, db):
     pub._session = FakeSession([api_error(401, "access_token_invalid", "expired")])
-    with pytest.raises(PublishFatal, match="access_token_invalid"):
+    with pytest.raises(AuthError, match="access_token_invalid"):  # account-level: the row is not touched
         pub.publish(clip, meta)
-    assert db.get_post(clip.id, "tiktok").status == "failed"
+    post = db.get_post(clip.id, "tiktok")
+    assert post.status == "pending" and post.attempts == 0
+    assert any(r["action"] == "publish.failed" and "access_token_invalid" in r["detail"] for r in db.recent_log())
 
     db.mark_post_failed(clip.id, "tiktok", "reset", None)  # back to pending so the next attempt is allowed
     pub._session = FakeSession([api_error(429, "rate_limit_exceeded")])
@@ -371,9 +412,20 @@ def test_expired_token_is_refreshed_first(pub, clip, meta):
 
 def test_unrefreshable_token_is_fatal_without_http(pub, clip, meta, db):
     write_token(pub, expires_in=-10, refresh_in=-10)
-    with pytest.raises(PublishFatal, match="clipforge auth tiktok"):
+    assert pub.credentials_ok() is False
+    with pytest.raises(AuthError, match="clipforge auth tiktok"):
         pub.publish(clip, meta)
-    assert pub._session.calls == [] and db.get_post(clip.id, "tiktok").status == "failed"
+    post = db.get_post(clip.id, "tiktok")
+    assert pub._session.calls == [] and post.status == "pending" and post.attempts == 0  # not this clip's fault
+
+
+def test_credentials_ok_probe(pub):
+    assert pub.credentials_ok() is True and pub._session.calls == []
+    write_token(pub, expires_in=-1, access="old")
+    pub._session = FakeSession([FakeResponse(400, {"error": "invalid_grant", "error_description": "revoked"})])
+    assert pub.credentials_ok() is False  # refresh refused -> platform skip, no exception
+    pub._token_path.unlink()
+    assert pub.credentials_ok() is False
 
 
 def test_already_posted_clip_makes_no_http_call(pub, clip, meta, db):

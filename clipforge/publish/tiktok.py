@@ -5,6 +5,10 @@ REFRESH_MARGIN_S of expiry) -> creator_info/query (privacy options + creator nam
 (read range by range, never the whole file) -> poll status/fetch -> mark_posted.  Every attempt is recorded in the
 posts table and the log table.  Secrets (tokens, client secret) are never logged or printed.
 
+Once every chunk is accepted TikTok owns the video and will publish it, so the publish_id is persisted in the kv
+table (PUBLISH_ID_KEY) before polling; if polling times out, fails on transport or the process dies, the next attempt
+resumes polling that id instead of uploading the clip a second time. The key is cleared once the outcome is known.
+
 Docs: https://developers.tiktok.com/doc/content-posting-api-reference-direct-post (init/upload/status),
 https://developers.tiktok.com/doc/content-posting-api-reference-errors (error codes),
 https://developers.tiktok.com/doc/login-kit-desktop (authorize URL, PKCE) and
@@ -28,7 +32,7 @@ from ..config import Settings, TikTokCfg
 from ..db import DB, Clip
 from ..log import console, get_logger
 from ..metadata import ClipMeta
-from .base import Limits, PublishError, PublishFatal, Publisher
+from .base import AuthError, Limits, PublishError, PublishFatal, Publisher
 
 log = get_logger(__name__)
 
@@ -79,6 +83,8 @@ RATE_LIMIT_STATUS = 429
 # error.code values that mean "try again later" (verify: content-posting-api-reference-errors); every other non-ok
 # code (access_token_invalid, scope_not_authorized, invalid_params, spam_risk_*, ...) is fatal for this attempt.
 RETRYABLE_ERROR_CODES = frozenset({"rate_limit_exceeded", "internal_error"})
+AUTH_ERROR_CODES = frozenset({"access_token_invalid"})  # account-level: the row is left untouched, re-run `clipforge auth tiktok`
+PUBLISH_ID_KEY = "tiktok.publish_id.{clip_id}"  # kv: publish_id whose upload completed but whose status is not final yet
 
 UNAUDITED_NOTE = "unaudited apps: SELF_ONLY, private account, <= 5 users / 24 h"
 SETUP_HELP = (
@@ -93,6 +99,10 @@ SETUP_HELP = (
 )
 
 ChunkRanges = list[tuple[int, int]]
+
+
+class PublishRejected(PublishFatal):
+    """TikTok processed the upload and reported status FAILED (the publish_id is dead; a new attempt starts over)."""
 
 
 # ---- pure helpers -----------------------------------------------------------------------------------------------------
@@ -247,6 +257,8 @@ def api_data(resp: requests.Response, what: str) -> dict[str, Any]:
     detail = f"HTTP {resp.status_code} {code}: {message} (log_id {log_id})".strip()
     if resp.status_code == RATE_LIMIT_STATUS or code in RETRYABLE_ERROR_CODES:
         raise PublishError(f"tiktok {what}: {detail} - retry later")
+    if code in AUTH_ERROR_CODES:
+        raise AuthError(f"tiktok {what}: {detail} - run `clipforge auth tiktok`")
     if resp.status_code >= 400 or code != "ok":
         raise PublishFatal(f"tiktok {what}: {detail}")
     data = payload.get("data")
@@ -271,6 +283,12 @@ class TikTokPublisher(Publisher):
     # ---- Publisher API ------------------------------------------------------------------------------------------------
     def is_configured(self) -> bool:
         return self._has_app_credentials() and self._token_path.is_file()
+
+    def credentials_ok(self) -> bool:
+        try:
+            return self._usable_token() is not None
+        except PublishError:  # refresh refused
+            return False
 
     def limits(self) -> Limits:
         posted = self.posted_today()
@@ -300,7 +318,8 @@ class TikTokPublisher(Publisher):
         try:
             post_id = self._publish_flow(clip, meta)
         except PublishError as err:
-            self.db.mark_post_failed(clip.id, self.name, str(err), next_attempt_at=None, final=isinstance(err, PublishFatal))
+            if not isinstance(err, AuthError):  # an AuthError is the account's problem, not the clip's: row untouched
+                self.db.mark_post_failed(clip.id, self.name, str(err), next_attempt_at=None, final=isinstance(err, PublishFatal))
             self.db.log("publish.failed", f"tiktok {clip.id}: {err}", level="error")
             log.error("tiktok: publish %s failed: %s", clip.id, err)
             raise
@@ -318,6 +337,11 @@ class TikTokPublisher(Publisher):
         if size <= 0:
             raise PublishFatal(f"tiktok: clip file is empty: {path}")
         token = self._access_token()
+        key = PUBLISH_ID_KEY.format(clip_id=clip.id)
+        resumed = self.db.kv_get(key)
+        if resumed:
+            log.info("tiktok: resuming publish_id=%s for %s (upload already complete; polling status only)", resumed, clip.id)
+            return self._finish_publish(token, key, resumed)
         creator = self._creator_info(token)
         privacy = pick_privacy(self.cfg.privacy, [str(o) for o in creator.get("privacy_level_options") or []])
         chunk, total, ranges = chunk_plan(size, self.cfg.chunk_size, min_chunk=self._min_chunk)
@@ -327,7 +351,17 @@ class TikTokPublisher(Publisher):
             raise PublishFatal("tiktok video/init: response lacks publish_id or upload_url")
         log.info("tiktok: uploading %s (%d bytes, %d chunk(s), %s) publish_id=%s", path.name, size, total, privacy, publish_id)
         self._upload(path, upload_url, ranges, size)
-        done = self._wait_for_publish(token, publish_id)
+        self.db.kv_set(key, publish_id)  # point of no return: TikTok has the whole video and will publish it
+        return self._finish_publish(token, key, publish_id)
+
+    def _finish_publish(self, token: str, key: str, publish_id: str) -> str:
+        """Poll until the outcome is known and clear the stored publish_id then; a retryable error leaves it for a resume."""
+        try:
+            done = self._wait_for_publish(token, publish_id)
+        except PublishRejected:
+            self.db.kv_delete(key)
+            raise
+        self.db.kv_delete(key)
         ids = done.get(POST_ID_FIELD) or []
         return str(ids[0]) if ids else publish_id
 
@@ -362,7 +396,7 @@ class TikTokPublisher(Publisher):
             if status == STATUS_COMPLETE:
                 return data
             if status == STATUS_FAILED:
-                raise PublishFatal(f"tiktok: publish {publish_id} failed: {data.get('fail_reason') or 'no fail_reason given'}")
+                raise PublishRejected(f"tiktok: publish {publish_id} failed: {data.get('fail_reason') or 'no fail_reason given'}")
             if waited >= POLL_TIMEOUT_S:
                 raise PublishError(f"tiktok: publish {publish_id} still {status or 'pending'} after {POLL_TIMEOUT_S}s")
             if status not in STATUS_IN_PROGRESS:
@@ -448,7 +482,7 @@ class TikTokPublisher(Publisher):
     def _access_token(self) -> str:
         token = self._usable_token()
         if token is None:
-            raise PublishFatal("tiktok: not authenticated or token expired - run `clipforge auth tiktok`")
+            raise AuthError("tiktok: not authenticated or token expired - run `clipforge auth tiktok`")
         return token
 
     def _refresh(self, tok: dict[str, Any]) -> dict[str, Any]:

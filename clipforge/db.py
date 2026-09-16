@@ -1,7 +1,8 @@
 """SQLite state. One file, WAL mode, short-lived connections (safe for the process pool + daemon).
 
 Tables: videos, clips, posts, budget, log, kv.  All timestamps are ISO-8601 UTC strings.
-Idempotency rules enforced here: a video id is unique; (clip_id, platform) can only be `posted` once.
+Idempotency rules enforced here: a video id is unique; (clip_id, platform) can only be `posted` once, and a post row
+must be claimed (`uploading`, see claim_post) before an upload starts so two processes never post the same clip.
 """
 from __future__ import annotations
 
@@ -48,12 +49,13 @@ CREATE TABLE IF NOT EXISTS posts (
   clip_id TEXT NOT NULL REFERENCES clips(id),
   platform TEXT NOT NULL,
   post_id TEXT,
-  status TEXT NOT NULL DEFAULT 'pending',   -- pending|posted|failed
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending|uploading|posted|failed
   attempts INTEGER NOT NULL DEFAULT 0,
   next_attempt_at TEXT,
   error TEXT,
   created_at TEXT NOT NULL,
-  posted_at TEXT
+  posted_at TEXT,
+  claimed_at TEXT                           -- set while a process holds the row as `uploading`
 );
 CREATE UNIQUE INDEX IF NOT EXISTS posts_unique_posted ON posts(clip_id, platform) WHERE status = 'posted';
 CREATE TABLE IF NOT EXISTS budget (
@@ -74,6 +76,8 @@ CREATE TABLE IF NOT EXISTS kv (
   value TEXT
 );
 """
+# Columns added after the first release; CREATE TABLE IF NOT EXISTS does not add them to existing workspace DBs.
+MIGRATIONS = {"posts": {"claimed_at": "TEXT"}}
 
 
 def utcnow() -> str:
@@ -125,6 +129,7 @@ class Post:
     error: str | None
     created_at: str
     posted_at: str | None
+    claimed_at: str | None = None
 
 
 def _row_video(r: sqlite3.Row) -> Video:
@@ -147,6 +152,11 @@ class DB:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connect() as c:
             c.executescript(SCHEMA)
+            for table, columns in MIGRATIONS.items():
+                present = {r["name"] for r in c.execute(f"PRAGMA table_info({table})").fetchall()}
+                for column, decl in columns.items():
+                    if column not in present:
+                        c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -272,6 +282,35 @@ class DB:
             r = c.execute("SELECT * FROM posts WHERE clip_id=? AND platform=? ORDER BY id DESC LIMIT 1", (clip_id, platform)).fetchone()
             return _row_post(r)
 
+    def claim_post(self, clip_id: str, platform: str, now_iso: str, stale_before_iso: str) -> bool:
+        """Atomically take the latest (clip, platform) row as `uploading`; False when another process holds it.
+
+        Claimable: `pending` and `failed` rows (an explicit retry of a final failure) and `uploading` rows whose claim
+        is older than `stale_before_iso` (a process that died mid-upload must not block the clip forever).
+        """
+        with self.connect() as c:
+            cur = c.execute(
+                "UPDATE posts SET status='uploading', claimed_at=? "
+                "WHERE id=(SELECT id FROM posts WHERE clip_id=? AND platform=? ORDER BY id DESC LIMIT 1) "
+                "AND status IN ('pending','failed','uploading') AND (status<>'uploading' OR claimed_at IS NULL OR claimed_at<?)",
+                (now_iso, clip_id, platform, stale_before_iso),
+            )
+            return cur.rowcount == 1
+
+    def release_claim(self, clip_id: str, platform: str) -> None:
+        """Hand an `uploading` row back as `pending` (interrupted or declined upload: no verdict to record)."""
+        with self.connect() as c:
+            c.execute(
+                "UPDATE posts SET status='pending', claimed_at=NULL "
+                "WHERE id=(SELECT id FROM posts WHERE clip_id=? AND platform=? ORDER BY id DESC LIMIT 1) AND status='uploading'",
+                (clip_id, platform),
+            )
+
+    def delete_post(self, post_row_id: int) -> bool:
+        """Remove a row that never recorded an attempt (pending/uploading with attempts 0); True when one was deleted."""
+        with self.connect() as c:
+            return c.execute("DELETE FROM posts WHERE id=? AND status IN ('pending','uploading') AND attempts=0", (post_row_id,)).rowcount == 1
+
     def mark_posted(self, clip_id: str, platform: str, post_id: str) -> None:
         now = utcnow()
         with self.connect() as c:
@@ -350,3 +389,7 @@ class DB:
     def kv_set(self, key: str, value: str) -> None:
         with self.connect() as c:
             c.execute("INSERT INTO kv(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def kv_delete(self, key: str) -> None:
+        with self.connect() as c:
+            c.execute("DELETE FROM kv WHERE key=?", (key,))

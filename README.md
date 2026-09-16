@@ -162,9 +162,12 @@ brittle and against both platforms' terms on paper; install with `pip install "c
 
 `clipforge daemon` loops every `schedule.tick_s` seconds: process queued videos, then post `ready` clips at
 `schedule.times` (local time; a missed slot is not back-filled), at most one clip per platform per tick, `per_day` per
-platform, ≥ `min_gap_h` apart, honouring the YouTube quota budget. Only platforms with credentials are used. Failures
-back off exponentially (`backoff_base_s · 2^attempts`, capped at `backoff_max_s`, `max_attempts` tries; non-retryable
-errors stop immediately). Every action is written to the SQLite `log` table and `logs/clipforge.log`.
+platform, ≥ `min_gap_h` apart, honouring the YouTube quota budget. Only platforms with a stored token are used, and a
+token that no longer works is a per-platform skip (`clipforge auth <platform>`), never a failed clip. Failures back
+off exponentially (`backoff_base_s · 2^attempts`, capped at `backoff_max_s`, `max_attempts` tries; non-retryable
+errors stop immediately) and the platform waits out the same window before another clip is tried, so an outage costs
+one attempt per window rather than the whole queue. Every action is written to the SQLite `log` table and
+`logs/clipforge.log`.
 `clipforge tick` runs the same pass once:
 
 ```
@@ -213,8 +216,11 @@ real whisper `tiny` model skips itself when the model cannot be downloaded.
   retries after the Pacific reset. Titles/descriptions have `<`/`>` stripped (the API rejects them).
 * **TikTok** posts use the caption as `title`, `video_cover_timestamp_ms: 1000`, and mirror the creator's
   duet/comment/stitch settings; status is polled every 5 s for up to 10 min.
-* **Scheduler** posts the oldest ready clip first; a clip in backoff does not block the slot; a clip's status becomes
-  `posted` once every active platform has it; `publish --now` refuses to double-post and reports "already posted".
+* **Scheduler** posts the oldest ready clip first; after a failure the platform backs off for the same window as the
+  clip, and a clip still in backoff (or failed for good) does not block the slot once that window has passed; a clip's
+  status becomes `posted` once every active platform has it, but the scheduler still posts it to a platform it has
+  not reached yet; `publish --now` refuses to double-post ("already posted") and a running daemon and `publish --now`
+  claim a clip before uploading, so they never upload the same one twice.
 * **Manual/browser** publishers do not enforce `per_day` (a human is in the loop) but report it in `limits()`.
 * **Logs** go to `logs/` (configurable, gitignored); the workspace is gitignored too.
 * **Layout.** Assets live in `assets/{fonts,music}` at the repo root (editable install). A non-editable install points

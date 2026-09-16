@@ -24,6 +24,7 @@ dependencies = [
   "requests>=2.31",
   "pyperclip>=1.8",
   "imageio-ffmpeg>=0.5",
+  "tzdata>=2024.1",
 ]
 
 [project.optional-dependencies]

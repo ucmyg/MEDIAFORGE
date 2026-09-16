@@ -3,7 +3,8 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
+from functools import lru_cache
 
 from ..config import Settings
 from ..db import DB, Clip
@@ -35,6 +36,42 @@ class PublishError(RuntimeError):
 
 class PublishFatal(PublishError):
     """Non-retryable failure (bad credentials, rejected file, budget exhausted)."""
+
+
+class AuthError(PublishFatal):
+    """Platform-level credential failure (no token, refresh refused, HTTP 401/403 on the account).
+
+    Not this clip's fault: publishers and the scheduler leave the post row untouched (no attempt, no backoff, never
+    final) so the clip is picked up again once `clipforge auth <platform>` has been run.
+    """
+
+
+class NotConfirmed(PublishError):
+    """The human declined the hand-off (manual/browser) or the automation never attached the file: nothing was attempted
+    on the platform, so no attempt is recorded in the posts table."""
+
+
+PACIFIC = "America/Los_Angeles"  # YouTube's quota day
+PACIFIC_FALLBACK_OFFSET_H = -8  # used when the tz database is missing (Windows without the tzdata package)
+
+
+@lru_cache(maxsize=None)
+def pacific_tz() -> tzinfo:
+    """America/Los_Angeles, or a fixed UTC-8 (warned once) when no tz database is available."""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        return ZoneInfo(PACIFIC)
+    except ZoneInfoNotFoundError:
+        log.warning("youtube: tz database missing (pip install tzdata); using fixed UTC%d for the quota day", PACIFIC_FALLBACK_OFFSET_H)
+        return timezone(timedelta(hours=PACIFIC_FALLBACK_OFFSET_H))
+
+
+def _day_in(iso_ts: str, tz: tzinfo) -> str:
+    parsed = datetime.fromisoformat(iso_ts)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(tz).strftime("%Y-%m-%d")
 
 
 @dataclass
@@ -74,18 +111,27 @@ class Publisher(ABC):
         """Non-interactive: credentials/config present so the scheduler may use this publisher. Default True."""
         return True
 
-    # ---- shared helpers ------------------------------------------------
-    def today_key(self) -> str:
-        """Budget day key. YouTube quota resets at midnight Pacific; others use UTC."""
-        if self.name == "youtube":
-            from zoneinfo import ZoneInfo
+    def credentials_ok(self) -> bool:
+        """Non-interactive probe run by the scheduler before it touches a clip: True when a post could be made now.
 
-            return datetime.now(ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
-        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        Default True (nothing to check); API publishers verify/refresh the stored token so an unusable one becomes a
+        platform-level skip instead of a failed attempt on some clip.
+        """
+        return True
+
+    # ---- shared helpers ------------------------------------------------
+    def budget_tz(self) -> tzinfo:
+        """Budget-day zone: YouTube quota resets at midnight Pacific; others use UTC."""
+        return pacific_tz() if self.name == "youtube" else timezone.utc
+
+    def today_key(self) -> str:
+        """Budget day key (YYYY-MM-DD in budget_tz())."""
+        return datetime.now(self.budget_tz()).strftime("%Y-%m-%d")
 
     def posted_today(self) -> int:
-        day = self.today_key()
-        return len([p for p in self.db.list_posts(self.name, "posted") if (p.posted_at or "")[:10] == day])
+        """Posts whose posted_at (UTC ISO) falls on today_key() in the platform's budget zone."""
+        day, tz = self.today_key(), self.budget_tz()
+        return len([p for p in self.db.list_posts(self.name, "posted") if p.posted_at and _day_in(p.posted_at, tz) == day])
 
     def warn_once(self, key: str | None = None, message: str | None = None) -> None:
         """Print a loud warning the first time (per workspace DB) and log it; later calls only log at debug level."""

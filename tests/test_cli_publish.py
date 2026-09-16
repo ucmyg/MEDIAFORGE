@@ -20,7 +20,7 @@ from clipforge import cli as C
 from clipforge.cli import EXIT_FAILED, EXIT_USAGE, app
 from clipforge.config import Settings
 from clipforge.db import DB
-from clipforge.publish.base import PublishError, PublishFatal
+from clipforge.publish.base import NotConfirmed, PublishError, PublishFatal
 
 RUNNER = CliRunner()
 
@@ -158,6 +158,41 @@ def test_publish_errors_are_reported_and_set_exit_code(cli: Cli):
     retry = cli("publish", "--to", "youtube", "--now", "--manual", "--clip-id", "vid_01")  # explicit retry of a final failure
     assert retry.exit_code == 0 and cli.db.is_posted("vid_01", "youtube") and cli.db.get_clip("vid_01").status == "posted"
     assert "nothing to publish" in cli("publish", "--to", "youtube,tiktok", "--now", "--manual").output  # everything is out
+
+
+def test_publish_decline_is_reported_not_counted(cli: Cli):
+    cli.ready("vid_00")
+    cli.factory.failures = {"youtube": [NotConfirmed("not confirmed")]}
+    res = cli("publish", "--to", "youtube", "--now", "--manual")
+    assert res.exit_code == 0, res.output
+    assert "not confirmed" in res.output and "left ready" in res.output and "error" not in res.output
+    assert cli.db.get_post("vid_00", "youtube") is None and cli.db.get_clip("vid_00").status == "ready"
+    assert S._pick_clip(cli.db, "youtube", S._aware(None))[0].id == "vid_00"
+    cli.factory.failures = {}
+    res = cli("publish", "--to", "youtube", "--now", "--manual")  # answered next time
+    assert res.exit_code == 0 and cli.db.is_posted("vid_00", "youtube") and cli.db.get_post("vid_00", "youtube").attempts == 0
+
+
+def test_publish_unexpected_exception_is_reported_not_a_traceback(cli: Cli):
+    cli.ready("vid_00", "vid_01")
+    cli.factory.failures = {"youtube": [RuntimeError("network cable eaten")]}
+    res = cli("publish", "--to", "youtube", "--now", "--manual")
+    assert res.exit_code == 0, res.output  # vid_01 was still attempted and posted
+    assert "Traceback" not in res.output and "publish summary" in res.output
+    assert "RuntimeError: network cable eaten" in res.output.replace("\n", "")
+    assert cli.factory.made["youtube"].calls == ["vid_00", "vid_01"]
+    assert cli.db.get_post("vid_00", "youtube").status == "pending" and cli.db.is_posted("vid_01", "youtube")
+
+
+def test_publish_reports_a_clip_another_process_is_posting(cli: Cli):
+    cli.ready("vid_00")
+    cli.db.ensure_post("vid_00", "youtube")
+    now = S._aware(None)
+    assert cli.db.claim_post("vid_00", "youtube", S._iso_utc(now), S._iso_utc(now - S.CLAIM_STALE))  # e.g. the daemon, mid-upload
+    res = cli("publish", "--to", "youtube", "--now", "--manual")
+    assert res.exit_code == 0, res.output
+    assert "in progress" in res.output and "another clipforge process" in res.output.replace("\n", "")
+    assert cli.factory.made["youtube"].calls == [] and cli.db.get_post("vid_00", "youtube").status == "uploading"
 
 
 # ---- auth ---------------------------------------------------------------------------------------------------------------

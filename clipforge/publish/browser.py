@@ -9,10 +9,11 @@ responsible for every post and the account activity looks like a manual upload.
 publish() flow: ensure_not_posted -> rendered file check -> warn_once (ToS) -> caption to the clipboard -> open the
 upload page in the persistent profile -> set the file on the first input[type=file] -> best-effort caption fill
 (warns and leaves it to you when the selectors miss) -> hand off -> confirm -> mark_posted. Failures of the
-automation itself raise PublishError and are written to the log table only (no posts row), like a manual decline.
+automation itself raise NotConfirmed and are written to the log table only (no posts row), like a manual decline.
 
-Login: auth() opens the platform home page in the profile and waits for Enter; the profile is also usable straight
-from publish() because the window stays open until you confirm, so a first login can happen there as well.
+Login: auth() opens the platform home page in the profile and waits for Enter, but only for a fresh profile (one
+Chromium has not written cookies to yet); the profile is also usable straight from publish() because the window
+stays open until you confirm, so a first login can happen there as well.
 
 Playwright is an optional extra (`pip install "clipforge[browser]"` + `playwright install chromium`) and is imported
 lazily inside load_playwright(); PlaywrightDriver is the only class that touches it and BrowserPublisher._driver()
@@ -28,13 +29,14 @@ from rich.markup import escape
 from ..db import Clip
 from ..log import console, get_logger
 from ..metadata import ClipMeta
-from .base import PublishError, PublishFatal
+from .base import NotConfirmed, PublishFatal
 from .manual import CAPTION_SEPARATOR, UPLOAD_PAGES, InteractivePublisher, copy_to_clipboard
 
 log = get_logger(__name__)
 
 PLAYWRIGHT_INSTALL = 'pip install "clipforge[browser]" && playwright install chromium'
 PROFILE_DIRNAME = "browser_profile"  # <workspace>/browser_profile/<platform>: cookies + login of the automation profile
+PROFILE_COOKIES = ("Default", "Cookies")  # Chromium writes this once the profile has been used: the "already logged in" marker
 HOME_PAGES: dict[str, str] = {"youtube": "https://studio.youtube.com/", "tiktok": "https://www.tiktok.com/"}  # auth() login pages
 FILE_INPUT = "input[type=file]"  # first match on both upload pages (verify when a platform redesigns its uploader)
 TIKTOK_CAPTION_EDITOR = "[contenteditable=true]"  # TikTok's caption box (a DraftJS editor), first match
@@ -126,8 +128,19 @@ class BrowserPublisher(InteractivePublisher):
         """Factory for the page driver; tests replace it with a fake."""
         return PlaywrightDriver(self.name, self.profile_dir)
 
+    def profile_ready(self) -> bool:
+        """True once Chromium has written cookies into the profile (profile_dir itself is created on access, so it does not count)."""
+        return self.profile_dir.joinpath(*PROFILE_COOKIES).is_file()
+
     def auth(self) -> bool:
-        """Open the platform home page in the profile and wait for the user to log in; False only when Playwright is missing."""
+        """Open the platform home page in the profile and wait for the user to log in; False only when Playwright is missing.
+
+        A profile that has been used before is taken as logged in without opening a window (publish() would otherwise
+        need a second browser launch and keypress on every run); log in again from the publish() window if it is not.
+        """
+        if self.profile_ready():
+            log.info("%s: browser profile already present at %s", self.name, self.profile_dir)
+            return True
         try:
             drv = self._driver()
         except PublishFatal as err:
@@ -176,7 +189,7 @@ class BrowserPublisher(InteractivePublisher):
             detail = f"{type(err).__name__}: {err}"
             self.db.log("publish.browser", f"{self.name}: automation failed on {url}: {detail}", level="error")
             log.error("%s: browser automation failed: %s", self.name, detail)
-            raise PublishError(f"{self.name}: browser automation failed ({detail}); `clipforge publish --manual` still works") from err
+            raise NotConfirmed(f"{self.name}: browser automation failed ({detail}); `clipforge publish --manual` still works") from err
         log.info("%s: attached %s on %s", self.name, path.name, url)
         try:
             drv.fill_caption(text)

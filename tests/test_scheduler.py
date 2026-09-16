@@ -18,7 +18,7 @@ from clipforge import scheduler as S
 from clipforge.config import Settings
 from clipforge.db import DB, Clip
 from clipforge.metadata import ClipMeta, write_meta
-from clipforge.publish.base import Limits, Publisher, PublishError, PublishFatal
+from clipforge.publish.base import AuthError, Limits, NotConfirmed, Publisher, PublishError, PublishFatal
 
 TZ = timezone(timedelta(hours=2))
 DAY = date(2026, 9, 15)
@@ -47,7 +47,8 @@ class FakePublisher(Publisher):
         self.configured = configured
         self.records_failures = records_failures  # mimic the real publishers, which mark_post_failed themselves
         self.auth_ok = True
-        self.failures: list[Exception] = []
+        self.credentials = True
+        self.failures: list[BaseException] = []
         self.calls: list[str] = []
 
     def auth(self) -> bool:
@@ -55,6 +56,9 @@ class FakePublisher(Publisher):
 
     def is_configured(self) -> bool:
         return self.configured
+
+    def credentials_ok(self) -> bool:
+        return self.credentials
 
     def limits(self) -> Limits:
         posted = len(self.db.list_posts(self.name, "posted"))  # all-time: a frozen clock has no meaningful "today"
@@ -244,7 +248,8 @@ def test_backoff_then_give_up(sched: Sched):
     assert datetime.fromisoformat(post.next_attempt_at) == at("09:05") + timedelta(seconds=300)
     early = sched.tick("09:08")
     assert early.errors == [] and early.posted == [] and pub.calls == ["vid_00"]
-    assert early.skipped == ["youtube: slot 09:00 due but no ready clip to post (vid_00 retries after 09:10)"]
+    assert early.skipped == ["youtube: slot 09:00 due but youtube is backing off until 09:10 after a failure"]
+    assert S._pick_clip(sched.db, "youtube", at("09:08")) == (None, ["vid_00 retries after 09:10"])  # the clip itself waits too
     second = sched.tick("09:11")
     assert second.errors == ["youtube: vid_00 failed (attempt 2/3, retry after 09:21): boom 2"]
     assert datetime.fromisoformat(sched.post("vid_00", "youtube").next_attempt_at) == at("09:11") + timedelta(seconds=600)
@@ -253,23 +258,84 @@ def test_backoff_then_give_up(sched: Sched):
     post = sched.post("vid_00", "youtube")
     assert post.status == "failed" and post.attempts == 3 and post.next_attempt_at is None
     assert sched.db.get_clip("vid_00").status == "ready"  # still available to other platforms
-    nothing = sched.tick("09:30")
+    held = sched.tick("09:30")  # the platform waits out one more window (attempt 3 -> 1200 s) even after a final verdict
+    assert held.posted == [] and held.skipped == ["youtube: slot 09:00 due but youtube is backing off until 09:42 after a failure"]
+    nothing = sched.tick("09:43")
     assert nothing.posted == [] and nothing.skipped == ["youtube: slot 09:00 due but no ready clip to post (vid_00 failed permanently after 3 attempt(s))"]
     sched.add_ready("vid_01")
-    later = sched.tick("09:31")
+    later = sched.tick("09:44")
     assert later.posted == [("vid_01", "youtube", "youtube-4")] and pub.calls == ["vid_00", "vid_00", "vid_00", "vid_01"]
+    assert sched.db.kv_get("sched.youtube.cooldown_until") is None  # a success ends the cooldown
     assert [r["action"] for r in sched.db.recent_log(50)].count("schedule.failed") == 3
 
 
-def test_waiting_clip_does_not_block_the_slot(sched: Sched):
+def test_platform_backs_off_with_the_failed_clip_then_retries_it_first(sched: Sched):
     pub = sched.publishers["youtube"]
     pub.failures = [PublishError("boom")]
     sched.add_ready("vid_00", "vid_01")
     assert sched.tick("09:05").errors == ["youtube: vid_00 failed (attempt 1/3, retry after 09:10): boom"]
-    res = sched.tick("09:06")  # vid_00 is in backoff; the slot is still due, so the next ready clip goes out
-    assert res.posted == [("vid_01", "youtube", "youtube-2")] and res.errors == []
-    assert sched.tick("09:11").posted == []  # posting vid_01 satisfied the 09:00 slot; vid_00 waits for 13:00
-    assert sched.tick("13:05").posted == [("vid_00", "youtube", "youtube-3")] and pub.calls == ["vid_00", "vid_01", "vid_00"]
+    held = sched.tick("09:06")  # the failure may be systemic: no other clip is tried inside the backoff window
+    assert held.posted == [] and held.errors == [] and pub.calls == ["vid_00"]
+    assert held.skipped == ["youtube: slot 09:00 due but youtube is backing off until 09:10 after a failure"]
+    res = sched.tick("09:11")  # window over: the slot is still due and the oldest eligible clip (vid_00 again) goes out
+    assert res.posted == [("vid_00", "youtube", "youtube-2")] and res.errors == []
+    assert sched.tick("09:12").posted == []  # the 09:00 slot is satisfied
+    assert sched.tick("13:05").posted == [("vid_01", "youtube", "youtube-3")] and pub.calls == ["vid_00", "vid_00", "vid_01"]
+
+
+def test_platform_backs_off_after_a_failure_instead_of_burning_the_queue(sched: Sched):
+    """Four fatal failures (e.g. an environment problem) over four ticks cost one clip, not four."""
+    pub = sched.publishers["youtube"]
+    pub.failures = [PublishFatal("rejected")] * 4
+    sched.add_ready("vid_00", "vid_01", "vid_02", "vid_03")
+    results = [sched.tick(hhmm) for hhmm in ("09:00", "09:01", "09:02", "09:03")]
+    assert pub.calls == ["vid_00"]
+    assert results[0].errors == ["youtube: vid_00 failed (attempt 1/3, giving up): rejected"]
+    assert all(r.errors == [] and r.skipped == ["youtube: slot 09:00 due but youtube is backing off until 09:05 after a failure"] for r in results[1:])
+    assert [sched.post(c, "youtube") for c in ("vid_01", "vid_02", "vid_03")] == [None, None, None]
+    assert sched.tick("09:06").errors == ["youtube: vid_01 failed (attempt 1/3, giving up): rejected"]  # one attempt per window
+    assert pub.calls == ["vid_00", "vid_01"]
+
+
+def test_unusable_credentials_are_a_platform_skip_not_a_clip_failure(sched: Sched):
+    pub = sched.publishers["youtube"]
+    pub.credentials = False
+    sched.add_ready("vid_00", "vid_01")
+    for hhmm in ("09:05", "09:06", "09:07"):
+        res = sched.tick(hhmm)
+        assert res.posted == [] and res.errors == []
+        assert res.skipped == ["youtube: slot 09:00 due but no usable credentials; run `clipforge auth youtube`"]
+    assert pub.calls == [] and sched.db.list_posts() == []
+    pub.credentials = True  # `clipforge auth youtube` ran
+    assert sched.tick("09:08").posted == [("vid_00", "youtube", "youtube-1")]
+
+
+def test_real_youtube_publisher_with_revoked_token_fails_no_clip(sched: Sched, monkeypatch):
+    from clipforge.publish.youtube import YouTubePublisher
+
+    pub = YouTubePublisher(sched.settings, sched.db)
+    pub.token_path.write_text("{}", encoding="utf-8")  # configured, but the stored grant is revoked / unusable
+    monkeypatch.setattr(YouTubePublisher, "_load_credentials", lambda self: None)
+    sched.publishers = {"youtube": pub}
+    sched.add_ready("vid_00", "vid_01", "vid_02")
+    for hhmm in ("09:05", "09:06", "09:07"):
+        res = sched.tick(hhmm)
+        assert res.errors == [] and res.skipped == ["youtube: slot 09:00 due but no usable credentials; run `clipforge auth youtube`"]
+    assert sched.db.list_posts() == [] and all(c.status == "ready" for c in sched.db.list_clips())
+
+
+def test_auth_error_during_publish_leaves_the_row_untouched(sched: Sched):
+    """The token is revoked between the probe and the upload: no attempt is counted, only the platform cools down."""
+    pub = sched.publishers["youtube"]
+    pub.failures = [AuthError("youtube: HTTP 401 (Invalid Credentials); run `clipforge auth youtube` to re-authorise")]
+    sched.add_ready("vid_00", "vid_01")
+    res = sched.tick("09:05")
+    assert res.posted == [] and res.errors == ["youtube: vid_00 failed: youtube: HTTP 401 (Invalid Credentials); run `clipforge auth youtube` to re-authorise"]
+    post = sched.post("vid_00", "youtube")
+    assert post.status == "pending" and post.attempts == 0 and post.next_attempt_at is None and post.claimed_at is None
+    assert sched.tick("09:06").skipped == ["youtube: slot 09:00 due but youtube is backing off until 09:10 after a failure"]
+    assert sched.tick("09:11").posted == [("vid_00", "youtube", "youtube-2")]  # picked up again once the account works
+    assert [r["action"] for r in sched.db.recent_log(20)].count("schedule.failed") == 1
 
 
 def test_backoff_is_capped(sched: Sched):
@@ -335,7 +401,7 @@ def test_publish_fatal_is_final_immediately(sched: Sched):
     assert res.errors == ["youtube: vid_00 failed (attempt 1/3, giving up): rejected file"] and res.posted == []
     post = sched.post("vid_00", "youtube")
     assert post.status == "failed" and post.attempts == 1 and post.next_attempt_at is None
-    assert sched.tick("09:06").posted == [("vid_01", "youtube", "youtube-2")]
+    assert sched.tick("09:06").posted == [] and sched.tick("09:11").posted == [("vid_01", "youtube", "youtube-2")]
     assert sched.tick("13:05").posted == [] and pub.calls == ["vid_00", "vid_01"]
 
 
@@ -365,6 +431,66 @@ def test_allowance_exhausted_inside_publish_clip_records_nothing(sched: Sched):
     assert sched.post("vid_00", "youtube") is None and pub.calls == []
 
 
+def test_manual_decline_is_not_an_attempt(sched: Sched, monkeypatch):
+    """`publish --now --manual` answered with an empty line: no posts row, no backoff, the clip is offered again."""
+    import pyperclip
+
+    from clipforge.publish.manual import ManualPublisher
+
+    monkeypatch.setattr(pyperclip, "copy", lambda text: None)
+    pub = ManualPublisher("youtube", sched.settings, sched.db)
+    pub.open_fn = lambda url: True
+    pub.input_fn = lambda prompt: ""
+    sched.add_ready("vid_00")
+    for _ in range(6):  # more than max_attempts
+        with pytest.raises(NotConfirmed):
+            S.publish_clip(sched.settings, sched.db, pub, sched.ready[0], ["youtube"], now=at("09:05"), source="publish")
+    assert sched.post("vid_00", "youtube") is None and sched.db.get_clip("vid_00").status == "ready"
+    assert sched.db.kv_get("sched.youtube.cooldown_until") is None
+    assert S._pick_clip(sched.db, "youtube", at("09:06"))[0].id == "vid_00"
+    assert [r["action"] for r in sched.db.recent_log(20)].count("publish.failed") == 0
+
+    sched.db.mark_post_failed("vid_00", "youtube", "earlier real failure", None)  # a row with history: kept as it was
+    with pytest.raises(NotConfirmed):
+        S.publish_clip(sched.settings, sched.db, pub, sched.ready[0], ["youtube"], now=at("09:07"), source="publish")
+    post = sched.post("vid_00", "youtube")
+    assert post.status == "pending" and post.attempts == 1 and post.claimed_at is None
+
+    pub.input_fn = lambda prompt: "https://youtube.com/shorts/x"
+    assert S.publish_clip(sched.settings, sched.db, pub, sched.ready[0], ["youtube"], now=at("09:08"), source="publish") == "https://youtube.com/shorts/x"
+    assert sched.db.is_posted("vid_00", "youtube")
+
+
+def test_claim_keeps_two_processes_from_posting_the_same_clip(sched: Sched):
+    pub = sched.publishers["youtube"]
+    sched.add_ready("vid_00", "vid_01")
+    other_now = at("09:04")  # "the other process" (a concurrent `publish --now`) claimed vid_00 a minute ago
+    sched.db.ensure_post("vid_00", "youtube")
+    assert sched.db.claim_post("vid_00", "youtube", S._iso_utc(other_now), S._iso_utc(other_now - S.CLAIM_STALE))
+    with pytest.raises(S.InProgress, match="another clipforge process"):
+        S.publish_clip(sched.settings, sched.db, pub, sched.ready[0], ["youtube"], now=at("09:05"))
+    assert pub.calls == [] and sched.post("vid_00", "youtube").status == "uploading" and sched.post("vid_00", "youtube").attempts == 0
+    res = sched.tick("09:05")  # the daemon passes the claimed clip over and posts the next one
+    assert res.posted == [("vid_01", "youtube", "youtube-1")] and res.errors == []
+    stale = at("09:05") - S.CLAIM_STALE - timedelta(minutes=1)  # the other process died: its claim may be taken over
+    sched.db.kv_set("unused", "")
+    with sched.db.connect() as c:
+        c.execute("UPDATE posts SET claimed_at=? WHERE clip_id='vid_00'", (S._iso_utc(stale),))
+    assert sched.tick("13:05").posted == [("vid_00", "youtube", "youtube-2")]
+    assert len(sched.db.list_posts("youtube", "posted")) == 2
+
+
+def test_interrupt_during_upload_releases_the_claim(sched: Sched):
+    pub = sched.publishers["youtube"]
+    pub.failures = [KeyboardInterrupt()]
+    sched.add_ready("vid_00")
+    with pytest.raises(KeyboardInterrupt):
+        S.publish_clip(sched.settings, sched.db, pub, sched.ready[0], ["youtube"], now=at("09:05"))
+    post = sched.post("vid_00", "youtube")
+    assert post.status == "pending" and post.attempts == 0 and post.claimed_at is None and post.next_attempt_at is None
+    assert sched.tick("09:06").posted == [("vid_00", "youtube", "youtube-2")]
+
+
 # ---- idempotency / multi-platform -----------------------------------------------------------------------------------
 def test_never_posts_the_same_clip_twice_on_a_platform(sched: Sched):
     sched.add_ready("vid_00", "vid_01")
@@ -385,6 +511,29 @@ def test_dry_run_posts_nothing(sched: Sched):
     assert sched.tick("09:06", dry_run=True).posted == [("vid_00", "youtube", "")]  # still due, still not posted
 
 
+def test_dry_run_reports_the_queue_instead_of_processing_it(sched: Sched):
+    sched.add_ready("vid_00")
+    sched.db.add_video("vq", "local", "queued.mp4")
+    res = sched.tick("09:05", dry_run=True)
+    assert sched.queue_calls == 0 and res.processed == []
+    assert res.skipped == ["queue: would process 1 video(s) (vq)"] and res.posted == [("vid_00", "youtube", "")]
+    assert sched.db.get_video("vq").status == "queued"
+    assert sched.tick("09:05").posted == [("vid_00", "youtube", "youtube-1")] and sched.queue_calls == 1
+
+
+def test_one_platform_crash_does_not_stop_the_others(sched: Sched):
+    class Broken(FakePublisher):
+        def limits(self) -> Limits:
+            raise RuntimeError("tz database missing")
+
+    sched.publishers = {"youtube": Broken("youtube", sched.settings, sched.db), "tiktok": FakePublisher("tiktok", sched.settings, sched.db)}
+    sched.add_ready("vid_00")
+    res = sched.tick("09:05")
+    assert res.errors == ["youtube: tick failed: RuntimeError: tz database missing"]
+    assert res.posted == [("vid_00", "tiktok", "tiktok-1")]
+    assert sched.db.recent_log(1)[0]["action"] == "schedule.tick" and "tz database missing" in sched.db.recent_log(1)[0]["detail"]
+
+
 def test_unconfigured_publisher_is_skipped_unless_platforms_are_explicit(sched: Sched):
     sched.publishers["tiktok"] = FakePublisher("tiktok", sched.settings, sched.db, configured=False)
     sched.add_ready("vid_00", "vid_01")
@@ -393,7 +542,18 @@ def test_unconfigured_publisher_is_skipped_unless_platforms_are_explicit(sched: 
     assert res.skipped == ["tiktok: not configured (run `clipforge auth tiktok` or set platforms.tiktok in clipforge.yaml)"]
     assert sched.db.get_clip("vid_00").status == "posted"  # tiktok was not active, so youtube alone completes the clip
     explicit = sched.tick("09:06", platforms=["tiktok"])  # explicit platforms bypass the is_configured filter
-    assert explicit.posted == [("vid_01", "tiktok", "tiktok-1")] and explicit.skipped == []
+    assert explicit.posted == [("vid_00", "tiktok", "tiktok-1")] and explicit.skipped == []  # oldest clip tiktok has not got
+
+
+def test_posted_clip_missing_a_platform_is_still_picked(sched: Sched):
+    """`publish --now` defaults to --to youtube and flips the clip to `posted`; tiktok must still get it later."""
+    sched.add_ready("vid_00", "vid_01")
+    S.publish_clip(sched.settings, sched.db, sched.publishers["youtube"], sched.ready[0], ["youtube"], now=at("09:05"))
+    assert sched.db.get_clip("vid_00").status == "posted" and not sched.db.is_posted("vid_00", "tiktok")
+    clip, notes = S._pick_clip(sched.db, "tiktok", at("09:06"))
+    assert clip is not None and clip.id == "vid_00" and notes == []
+    clip, _ = S._pick_clip(sched.db, "youtube", at("09:06"))
+    assert clip.id == "vid_01"
 
 
 def test_clip_posted_only_once_every_active_platform_has_it(sched: Sched):
