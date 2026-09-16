@@ -127,11 +127,21 @@ def write_token(pub: TikTokPublisher, expires_in: float = 3600, refresh_in: floa
     return path
 
 
+def saved_state(db, clip_id):
+    raw = db.kv_get(tt.PUBLISH_ID_KEY.format(clip_id=clip_id))
+    if raw is None:
+        return None
+    data = json.loads(raw)
+    return data["publish_id"], data["uploaded"]
+
+
 @pytest.fixture()
 def pub(settings, db):
     """Configured publisher with a valid token, tiny chunks, fake session and recorded sleeps."""
     cfg = settings.platforms.tiktok
     cfg.client_key, cfg.client_secret, cfg.redirect_uri, cfg.chunk_size = "ck", "cs", REDIRECT, CHUNK
+    cfg.privacy, cfg.music_usage_confirmed = "SELF_ONLY", True  # the user's explicit posting choices
+    cfg.allow_comments = cfg.allow_duet = cfg.allow_stitch = True  # so init_body mirrors the creator's own settings below
     p = TikTokPublisher(settings, db)
     p._min_chunk = 1
     p.now_fn = lambda: 1_700_000_000.0
@@ -307,7 +317,7 @@ def test_poll_timeout_is_retryable(pub, clip, meta, db):
     assert not isinstance(ei.value, PublishFatal)
     assert len(pub.sleeps) == polls - 1 and all(s == tt.POLL_INTERVAL_S for s in pub.sleeps)
     assert db.get_post(clip.id, "tiktok").status == "pending"
-    assert db.kv_get(tt.PUBLISH_ID_KEY.format(clip_id=clip.id)) == "p1"  # the upload is complete: remembered for a resume
+    assert saved_state(db, clip.id) == ("p1", True)  # the upload is complete: remembered for a resume
 
 
 def test_retry_after_poll_timeout_resumes_the_same_publish_id_without_reupload(pub, clip, meta, db):
@@ -332,7 +342,7 @@ def test_retry_after_poll_timeout_resumes_the_same_publish_id_without_reupload(p
     pub._session = FakeSession([creator(), init_ok("second"), FakeResponse(206), FakeResponse(201), FakeResponse(500), FakeResponse(502), FakeResponse(503)])
     with pytest.raises(PublishError, match="after 3 attempts"):
         pub.publish(other, meta)
-    assert db.kv_get(tt.PUBLISH_ID_KEY.format(clip_id="vid2_00")) == "second"
+    assert saved_state(db, "vid2_00") == ("second", True)
     pub._session = FakeSession([status("PUBLISH_COMPLETE")])
     assert pub.publish(other, meta) == "second"
 
@@ -553,3 +563,75 @@ def test_publisher_factory_and_time_defaults(settings, db):
     p = get_publisher("tiktok", settings, db)
     assert isinstance(p, TikTokPublisher) and p.name == "tiktok"
     assert p.sleep_fn is time.sleep and p.now_fn is time.time and p.input_fn is input
+
+
+# ---- review fixes: no duplicate posts on retry, posting choices ---------------------------------------------------------
+def test_lost_final_upload_response_resumes_the_same_upload(pub, clip, meta, db):
+    """The last PUT's response never arrives: the next attempt resumes the recorded init instead of a second post."""
+    import requests as rq
+
+    pub._session = FakeSession([creator(), init_ok("first"), FakeResponse(206), rq.ConnectionError("reset"), rq.ConnectionError("reset"), rq.ConnectionError("reset")])
+    with pytest.raises(PublishError):
+        pub.publish(clip, meta)
+    assert saved_state(db, clip.id) == ("first", False)
+    pub._session = FakeSession([status("PROCESSING_UPLOAD"), FakeResponse(206), FakeResponse(201), status("PUBLISH_COMPLETE", publicaly_available_post_id=["9"])])
+    assert pub.publish(clip, meta) == "9"
+    urls = [u for _, u, _ in pub._session.calls]
+    assert tt.INIT_URL not in urls and tt.CREATOR_INFO_URL not in urls and urls.count("https://open-upload.tiktokapis.com/video/?upload_id=u1") == 2
+    assert saved_state(db, clip.id) is None and db.is_posted(clip.id, "tiktok")
+
+
+def test_resume_finds_the_interrupted_upload_already_processed(pub, clip, meta, db):
+    db.kv_set(tt.PUBLISH_ID_KEY.format(clip_id=clip.id), json.dumps({"publish_id": "x1", "upload_url": "https://u", "chunk_size": CHUNK, "uploaded": False}))
+    pub._session = FakeSession([status("PROCESSING_DOWNLOAD"), status("PUBLISH_COMPLETE", publicaly_available_post_id=["5"])])
+    assert pub.publish(clip, meta) == "5"
+    assert [u for _, u, _ in pub._session.calls] == [tt.STATUS_URL, tt.STATUS_URL]
+
+
+def test_state_survives_a_failure_to_record_success(pub, clip, meta, db, monkeypatch):
+    import sqlite3
+
+    pub._session = FakeSession(HAPPY)
+    real = db.mark_posted
+
+    def broken(*a, **k):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(db, "mark_posted", broken)
+    with pytest.raises(sqlite3.OperationalError):
+        pub.publish(clip, meta)
+    assert saved_state(db, clip.id) == ("p1", True)  # TikTok has the post; remembered until success is on record
+    monkeypatch.setattr(db, "mark_posted", real)
+    pub._session = FakeSession([status("PUBLISH_COMPLETE", publicaly_available_post_id=["7"])])
+    assert pub.publish(clip, meta) == "7" and saved_state(db, clip.id) is None and db.is_posted(clip.id, "tiktok")
+    assert [u for _, u, _ in pub._session.calls] == [tt.STATUS_URL]  # no second upload
+
+
+def test_posting_choices_are_required_before_anything_is_recorded(pub, clip, meta, db):
+    pub._session = FakeSession([])
+    pub.cfg.privacy = None
+    with pytest.raises(PublishFatal, match="choose who can view"):
+        pub.publish(clip, meta)
+    pub.cfg.privacy = "SELF_ONLY"
+    pub.cfg.music_usage_confirmed = False
+    with pytest.raises(PublishFatal, match="Music Usage"):
+        pub.publish(clip, meta)
+    pub.cfg.music_usage_confirmed = True
+    pub.cfg.commercial_content = pub.cfg.branded_content = True
+    with pytest.raises(PublishFatal, match="branded content"):
+        pub.publish(clip, meta)
+    assert pub._session.calls == [] and db.get_post(clip.id, "tiktok") is None
+
+
+def test_init_body_interactions_off_unless_enabled_and_disclosure_toggles():
+    from clipforge.config import TikTokCfg
+
+    cr = {"comment_disabled": False, "duet_disabled": False, "stitch_disabled": False}
+    body = tt.init_body("c", "SELF_ONLY", cr, 10, 10, 1)["post_info"]
+    assert (body["disable_comment"], body["disable_duet"], body["disable_stitch"]) == (True, True, True) and "brand_content_toggle" not in body
+    cfg = TikTokCfg(allow_comments=True, allow_duet=True, commercial_content=True, brand_organic=True)
+    body = tt.init_body("c", "SELF_ONLY", cr, 10, 10, 1, cfg)["post_info"]
+    assert (body["disable_comment"], body["disable_duet"], body["disable_stitch"]) == (False, False, True)
+    assert body["brand_organic_toggle"] is True and body["brand_content_toggle"] is False
+    body = tt.init_body("c", "SELF_ONLY", {"comment_disabled": True}, 10, 10, 1, cfg)["post_info"]
+    assert body["disable_comment"] is True  # the creator's own setting still wins

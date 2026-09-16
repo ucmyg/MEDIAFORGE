@@ -351,7 +351,23 @@ def test_process_video_force_keeps_posted_clips(settings, db, fakes: Fakes):
     report = pipeline.process_video("vid", settings, db, force=True)
     kept = db.get_clip("vid_00")
     assert kept.status == "posted" and kept.start == first.clips[0].start and Path(kept.path).is_file()
-    assert fakes.render_calls[-1] == ["vid_01.mp4", "vid_02.mp4"] and report.status == "done"
+    # the reversed fake selection no longer contains vid_00's bounds: the new clip that would have taken idx 0 gets a
+    # fresh id instead of overwriting the published one
+    assert fakes.render_calls[-1] == ["vid_01.mp4", "vid_02.mp4", "vid_03.mp4"] and report.status == "done"
+    assert {c.id for c in report.clips} == {"vid_00", "vid_01", "vid_02", "vid_03"}
+
+
+def test_process_video_force_keeps_clips_posted_on_one_platform_only(settings, db, fakes: Fakes):
+    """Posted to YouTube, still `ready` for TikTok: the file and bounds must survive --force (its YouTube post exists)."""
+    first = pipeline.process_video("vid", settings, db)
+    db.mark_posted("vid_00", "youtube", "yt-1")  # clip status stays `ready` (tiktok pending)
+    db.set_clip_status("vid_00", "ready")
+    path = Path(first.clips[0].path)
+    fakes.candidates = list(reversed(fakes.candidates))
+    report = pipeline.process_video("vid", settings, db, force=True)
+    kept = db.get_clip("vid_00")
+    assert report.status == "done" and kept.start == first.clips[0].start and kept.path == str(path) and path.is_file()
+    assert "vid_00.mp4" not in fakes.render_calls[-1]
 
 
 def test_process_video_render_failure_marks_video_failed(settings, db, fakes: Fakes):

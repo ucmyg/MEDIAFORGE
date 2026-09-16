@@ -102,9 +102,11 @@ smart:     false              # face-tracked crop (OpenCV Haar cascade, 1 fps sa
 music:     {enabled: false, file: "", gain_db: -22}   # royalty-free files you drop into assets/music/
 selector:  {mode: heuristic, llm_base_url: http://localhost:11434/v1, llm_model: llama3.1, llm_api_key: ollama}
 platforms:
-  youtube: {privacy: private, category: "22", per_day: 3, upload_cost: 1600, daily_quota: 10000, publish_at: null,
-            client_secret: client_secret.json, token_file: youtube_token.json, made_for_kids: false}
-  tiktok:  {privacy: SELF_ONLY, per_day: 2, client_key: "", client_secret: "", redirect_uri: "", token_file: tiktok_token.json}
+  youtube: {privacy: private, category: "22", per_day: 3, upload_cost: 1, daily_quota: 10000, uploads_per_day: 100,
+            publish_at: null, client_secret: client_secret.json, token_file: youtube_token.json, made_for_kids: false}
+  tiktok:  {privacy: null, per_day: 2, client_key: "", client_secret: "", redirect_uri: "", token_file: tiktok_token.json,
+            allow_comments: false, allow_duet: false, allow_stitch: false, commercial_content: false,
+            brand_organic: false, branded_content: false, music_usage_confirmed: false}
 schedule:  {times: ["09:00", "13:00", "18:00"], min_gap_h: 2, tick_s: 60, backoff_base_s: 300, backoff_max_s: 21600, max_attempts: 5}
 paths:     {workspace: workspace, db: "", logs: logs, assets: ""}
 render:    {preset: veryfast, crf: 22, encoder: auto, workers: 0, fps: 30, width: 1080, height: 1920}
@@ -134,10 +136,12 @@ Caveats you cannot configure away:
 * **Unverified API projects upload as private.** Until the project passes Google's YouTube API compliance audit
   (https://support.google.com/youtube/contact/yt_api_form), every API upload is locked to `private`, whatever
   `privacyStatus` you send. ClipForge defaults to `private` and prints a one-time warning.
-* **Quota.** `videos.insert` costs `platforms.youtube.upload_cost` units (1600 when this was written) out of
-  `daily_quota` (10 000 units/day by default), resetting at midnight Pacific — about 6 uploads a day. ClipForge counts the
-  spend in SQLite, refuses when the budget is gone and marks the day exhausted if Google answers `quotaExceeded`. Both
-  numbers are config keys because Google changes them; verify at https://developers.google.com/youtube/v3/determine_quota_cost.
+* **Quota.** Current documentation gives uploads their own bucket: `platforms.youtube.uploads_per_day` calls per day
+  (100) at `upload_cost` units each (1) out of the general `daily_quota` (10 000 units/day); the older model charged
+  1600 units per upload. All three are config keys; ClipForge enforces the smallest of `per_day`, the upload bucket and
+  the unit budget, counts the spend in SQLite, and marks the day exhausted if Google answers `quotaExceeded` or
+  `uploadLimitExceeded`. Verify at https://developers.google.com/youtube/v3/docs/videos/insert and
+  https://developers.google.com/youtube/v3/determine_quota_cost.
 * **Testing-mode refresh tokens expire after 7 days.** Re-run `clipforge auth youtube` when `doctor` or a post says
   the token is invalid, or move the consent screen to *In production* (an "unverified app" screen appears once, the token
   then stops expiring).
@@ -162,7 +166,15 @@ Caveats you cannot configure away:
 * **Unaudited apps post `SELF_ONLY`, to private accounts only, for at most 5 users per 24 h.** Until TikTok's review
   passes, `creator_info/query` only offers `SELF_ONLY`, the posting account must be set to *private* in the TikTok app
   and posts are visible only to you. ClipForge always queries `creator_info` first, prints the account it is about to
-  post to, and only sends a `privacy_level` that endpoint returned (default `SELF_ONLY`).
+  post to, and only sends a `privacy_level` that endpoint returned.
+* **You must make the posting choices yourself** (TikTok's content-sharing guidelines forbid defaults): who can view
+  (`platforms.tiktok.privacy`, no default), whether comments / duet / stitch are allowed (all off unless you enable
+  them), commercial-content disclosure (`commercial_content` with `brand_organic` / `branded_content`; branded content
+  cannot be `SELF_ONLY`), and acceptance of TikTok's Music Usage Confirmation (`music_usage_confirmed: true`).
+  The web UI's Publish tab has a form for exactly these fields; the CLI refuses to post until they are set.
+* **Audit eligibility.** TikTok's guidelines exclude "private account-management utilities" from acceptable Direct Post
+  use. ClipForge posts a creator's own content from their own machine; describe it that way in the app review, and keep
+  the manual path (caption + upload page) as the fallback if the review declines Direct Post.
 * If the token exchange fails with an invalid `code_verifier`, flip `PKCE_CHALLENGE_ENCODING` in
   `clipforge/publish/tiktok.py` from `"hex"` (TikTok's desktop sample) to `"base64url"` (RFC 7636); both are implemented.
 
@@ -239,6 +251,12 @@ real whisper `tiny` model skips itself when the model cannot be downloaded.
   retries after the Pacific reset. Titles/descriptions have `<`/`>` stripped (the API rejects them).
 * **TikTok** posts use the caption as `title`, `video_cover_timestamp_ms: 1000`, and mirror the creator's
   duet/comment/stitch settings; status is polled every 5 s for up to 10 min.
+* **Publishing safety.** A clip's approval is re-checked under the upload claim, so rejecting it after a publish job
+  was queued cancels the upload. Daily caps and the minimum gap are reserved inside the same SQLite transaction as the
+  claim and count uploads in flight, so two schedulers cannot each take the last slot. A clip that is posted on any
+  platform (or being uploaded) keeps its id, bounds and file through `run --force`; new selections get fresh ids.
+  TikTok records the `publish_id` before the first byte is sent and keeps it until success is on record, so a lost
+  response or a crash resumes that upload (or polls its status) instead of creating a second post.
 * **Scheduler** posts the oldest ready clip first; after a failure the platform backs off for the same window as the
   clip, and a clip still in backoff (or failed for good) does not block the slot once that window has passed; a clip's
   status becomes `posted` once every active platform has it, but the scheduler still posts it to a platform it has
@@ -273,7 +291,7 @@ clipforge add "https://www.youtube.com/watch?v=VIDEO_ID" --count 5 --min 20 --ma
 clipforge run
 clipforge review                 # open workspace/review.html, export decisions.json → clipforge review --apply decisions.json
 clipforge publish --to youtube --now             # private upload, video id recorded in SQLite
-clipforge publish --to tiktok --now              # SELF_ONLY post
+clipforge publish --to tiktok --now              # after choosing privacy + accepting the music terms (Publish tab or yaml)
 clipforge publish --to youtube,tiktok --now --manual   # no-credentials path
 
 # 4. hands-off

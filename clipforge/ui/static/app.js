@@ -801,6 +801,7 @@
         setText(noteEl, '');
       }
     }
+    fillTikTokPosting((st.settings && st.settings.tiktok) || null);
     const videos = videosById();
     const clips = publishable(st.clips);
     const ids = new Set(clips.map((c) => c.id));
@@ -905,6 +906,32 @@
       });
       refresh();
     } catch (e) { toast(e.message, 'error'); } finally { if (S.state) updatePublishControls(publishable(S.state.clips)); }
+  }
+  const TT_KEYS = ['allow_comments', 'allow_duet', 'allow_stitch', 'commercial_content', 'brand_organic', 'branded_content', 'music_usage_confirmed'];
+  function fillTikTokPosting(tt) {
+    const form = $('#tiktok-posting');
+    if (!form || !tt || S.ttDirty || form.contains(document.activeElement)) return;
+    form.elements.privacy.value = tt.privacy || '';
+    for (const k of TT_KEYS) if (form.elements[k]) form.elements[k].checked = !!tt[k];
+    show($('#tt-disclosure'), !!tt.commercial_content);
+    setText($('#tiktok-posting-status'), tt.privacy && tt.music_usage_confirmed ? 'ready to post' : 'incomplete: choose privacy and accept the music terms');
+  }
+  async function saveTikTokPosting(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const errEl = $('#tiktok-posting-error');
+    const body = { privacy: form.elements.privacy.value || '' };
+    for (const k of TT_KEYS) body[k] = !!form.elements[k].checked;
+    show(errEl, false);
+    try {
+      await api('PUT', '/api/platforms/tiktok', body);
+      S.ttDirty = false;
+      toast('TikTok posting choices saved', 'ok');
+      refresh();
+    } catch (err) {
+      setText(errEl, err.message || String(err));
+      show(errEl, true);
+    }
   }
   function renderPublishResult(st) {
     let job = S.publishJobId != null ? st.jobs.find((j) => String(j.id) === String(S.publishJobId)) : null;
@@ -1236,6 +1263,8 @@
     $('#connect-youtube').addEventListener('click', connectYouTube);
     $('#connect-tiktok').addEventListener('click', connectTikTok);
     $('#tiktok-complete-form').addEventListener('submit', completeTikTok);
+    $('#tiktok-posting').addEventListener('submit', saveTikTokPosting);
+    $('#tiktok-posting').addEventListener('input', () => { S.ttDirty = true; show($('#tt-disclosure'), $('#tt-commercial').checked); });
     $('#tiktok-copy').addEventListener('click', async () => {
       const ok = await copyText($('#tiktok-auth-url').href);
       toast(ok ? 'link copied' : 'copy failed - select the link text and copy it by hand', ok ? 'ok' : 'error');

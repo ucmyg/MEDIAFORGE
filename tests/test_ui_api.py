@@ -915,3 +915,38 @@ def test_real_pipeline_end_to_end(api: TestClient, settings: Settings, fixture_v
     assert head.status_code == 206 and len(head.content) == 16 and b"ftyp" in head.content
     caption = api.get(f"/api/clips/{clips[0]['id']}/caption", params={"platform": "tiktok"}).json()
     assert caption["caption"].startswith(clips[0]["meta"]["title"])
+
+
+# ---- review fixes ----------------------------------------------------------------------------------------------------
+def test_publish_job_rechecks_approval_when_it_runs(api: TestClient, settings: Settings, db: DB, publishers):
+    """Rejected after the job was queued: the worker must not upload it."""
+    from clipforge.ui.jobs import Job, JobFailed
+    from clipforge.ui.server import _publish_fn
+
+    stub_clip(db, settings.workspace_dir, "vid_00")
+    fn = _publish_fn(api.app, ["vid_00"], ["youtube"])
+    db.set_clip_status("vid_00", "rejected")
+    job = Job(id="j1", kind="publish", detail="publish vid_00")
+    with pytest.raises(JobFailed, match="rejected"):
+        fn(job)
+    assert publishers["youtube"].calls == [] and job.result[0]["state"] == "error" and "rejected" in job.result[0]["detail"]
+    assert db.get_post("vid_00", "youtube") is None
+
+
+def test_tiktok_posting_choices_are_saved_to_the_config(api: TestClient, settings: Settings, db: DB):
+    import os
+
+    import yaml
+
+    from clipforge.config import CONFIG_ENV
+
+    res = api.put("/api/platforms/tiktok", json={"privacy": "SELF_ONLY", "music_usage_confirmed": True, "allow_comments": True})
+    assert res.status_code == 200, res.text
+    data = yaml.safe_load(Path(os.environ[CONFIG_ENV]).read_text(encoding="utf-8"))
+    assert data["platforms"]["tiktok"]["privacy"] == "SELF_ONLY" and data["platforms"]["tiktok"]["music_usage_confirmed"] is True
+    assert data["paths"]["workspace"] == settings.paths.workspace  # the rest of the live settings survived
+    tt = api.get("/api/state").json()["settings"]["tiktok"]
+    assert tt["privacy"] == "SELF_ONLY" and tt["allow_comments"] is True and tt["allow_duet"] is False
+    assert api.put("/api/platforms/tiktok", json={"bogus": 1}).status_code == 400
+    assert api.put("/api/platforms/tiktok", json={"privacy": ""}).status_code == 200  # clearing the choice again
+    assert api.get("/api/state").json()["settings"]["tiktok"]["privacy"] is None

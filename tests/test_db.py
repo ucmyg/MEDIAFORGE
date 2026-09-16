@@ -65,3 +65,27 @@ def test_kv_delete(db: DB):
     db.kv_delete("k")
     assert db.kv_get("k") is None
     db.kv_delete("k")  # missing key is fine
+
+
+def test_reserve_and_claim_counts_posts_and_live_claims(db: DB):
+    db.add_video("v", "local", "x.mp4")
+    for cid in ("v_00", "v_01", "v_02"):
+        db.upsert_clip(cid, "v", int(cid[-1]), 0.0, 1.0, 0.0, "")
+    day, stale, now = "2026-09-16T00:00:00+00:00", "2026-09-15T21:00:00+00:00", "2026-09-16T10:00:00+00:00"
+    db.ensure_post("v_00", "yt")
+    db.mark_posted("v_00", "yt", "a")
+    with db.connect() as c:
+        c.execute("UPDATE posts SET posted_at=? WHERE clip_id='v_00'", ("2026-09-16T09:00:00+00:00",))
+    db.ensure_post("v_01", "yt")
+    kw = dict(day_start_iso=day)
+    assert db.reserve_and_claim("v_01", "yt", now, stale, per_day=1, **kw) == "per_day"
+    assert db.reserve_and_claim("v_01", "yt", now, stale, per_day=2, gap_before_iso="2026-09-16T08:30:00+00:00", **kw) == "gap"
+    assert db.reserve_and_claim("v_01", "yt", now, stale, per_day=2, gap_before_iso="2026-09-16T09:30:00+00:00", **kw) == "ok"
+    assert db.get_post("v_01", "yt").status == "uploading"
+    db.ensure_post("v_02", "yt")
+    assert db.reserve_and_claim("v_02", "yt", now, stale, per_day=2, **kw) == "per_day"  # the live claim on v_01 is capacity
+    assert db.reserve_and_claim("v_02", "yt", now, stale, per_day=3, gap_before_iso="2026-09-16T09:59:00+00:00", **kw) == "gap"
+    assert db.reserve_and_claim("v_01", "yt", now, stale, per_day=3, **kw) == "busy"  # held by the other process
+    assert db.count_active("yt", day, stale) == 2 and db.latest_activity("yt", stale) == now
+    assert db.has_posted("v_00") and db.has_posted("v_01") and not db.has_posted("v_02")
+    assert db.reserve_and_claim("v_02", "yt", now, stale, per_day=3, **kw) == "ok"

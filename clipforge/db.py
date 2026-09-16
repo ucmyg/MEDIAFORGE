@@ -78,6 +78,7 @@ CREATE TABLE IF NOT EXISTS kv (
 """
 # Columns added after the first release; CREATE TABLE IF NOT EXISTS does not add them to existing workspace DBs.
 MIGRATIONS = {"posts": {"claimed_at": "TEXT"}}
+CLAIM_STALE_S = 3 * 3600  # an `uploading` claim older than this belongs to a dead process and may be taken over
 
 
 def utcnow() -> str:
@@ -159,14 +160,16 @@ class DB:
                         c.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     @contextmanager
-    def connect(self) -> Iterator[sqlite3.Connection]:
+    def connect(self, immediate: bool = False) -> Iterator[sqlite3.Connection]:
+        """One transaction. `immediate=True` takes the write lock up front so a read-then-write decision (capacity
+        check + claim) is atomic across processes instead of racing between the SELECT and the UPDATE."""
         con = sqlite3.connect(self.path, timeout=30, isolation_level=None)
         con.row_factory = sqlite3.Row
         try:
             con.execute("PRAGMA journal_mode=WAL")
             con.execute("PRAGMA busy_timeout=30000")
             con.execute("PRAGMA foreign_keys=ON")
-            con.execute("BEGIN")
+            con.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
             yield con
             if con.in_transaction:
                 con.execute("COMMIT")
@@ -296,6 +299,74 @@ class DB:
                 (now_iso, clip_id, platform, stale_before_iso),
             )
             return cur.rowcount == 1
+
+    def reserve_and_claim(
+        self,
+        clip_id: str,
+        platform: str,
+        now_iso: str,
+        stale_before_iso: str,
+        *,
+        day_start_iso: str,
+        per_day: int,
+        gap_before_iso: str | None = None,
+    ) -> str:
+        """Atomically check the platform's capacity and take the (clip, platform) row as `uploading`.
+
+        Capacity counts posts completed since `day_start_iso` PLUS uploads other processes are holding a live claim
+        on (claimed_at >= stale_before_iso), so two schedulers cannot both see "0 posted today" and each start one.
+        `gap_before_iso` (optional) refuses when any post or live claim is newer than it (the min_gap rule).
+        Returns "ok", "busy" (row held by another process), "per_day" or "gap". Nothing is written unless "ok".
+        """
+        with self.connect(immediate=True) as c:
+            active = c.execute(
+                "SELECT COUNT(*) AS n FROM posts WHERE platform=? AND ("
+                "(status='posted' AND posted_at>=?) OR (status='uploading' AND claimed_at IS NOT NULL AND claimed_at>=? AND clip_id<>?))",
+                (platform, day_start_iso, stale_before_iso, clip_id),
+            ).fetchone()["n"]
+            if per_day >= 0 and active >= per_day:
+                return "per_day"
+            if gap_before_iso is not None:
+                recent = c.execute(
+                    "SELECT COUNT(*) AS n FROM posts WHERE platform=? AND clip_id<>? AND ("
+                    "(status='posted' AND posted_at>?) OR (status='uploading' AND claimed_at IS NOT NULL AND claimed_at>? AND claimed_at>=?))",
+                    (platform, clip_id, gap_before_iso, gap_before_iso, stale_before_iso),
+                ).fetchone()["n"]
+                if recent:
+                    return "gap"
+            cur = c.execute(
+                "UPDATE posts SET status='uploading', claimed_at=? "
+                "WHERE id=(SELECT id FROM posts WHERE clip_id=? AND platform=? ORDER BY id DESC LIMIT 1) "
+                "AND status IN ('pending','failed','uploading') AND (status<>'uploading' OR claimed_at IS NULL OR claimed_at<?)",
+                (now_iso, clip_id, platform, stale_before_iso),
+            )
+            return "ok" if cur.rowcount == 1 else "busy"
+
+    def count_active(self, platform: str, since_iso: str, stale_before_iso: str) -> int:
+        """Posts completed since `since_iso` plus uploads with a live claim: what the daily allowance must count."""
+        with self.connect() as c:
+            return int(
+                c.execute(
+                    "SELECT COUNT(*) AS n FROM posts WHERE platform=? AND ("
+                    "(status='posted' AND posted_at>=?) OR (status='uploading' AND claimed_at IS NOT NULL AND claimed_at>=?))",
+                    (platform, since_iso, stale_before_iso),
+                ).fetchone()["n"]
+            )
+
+    def latest_activity(self, platform: str, stale_before_iso: str) -> str | None:
+        """Newest of: last completed post, last live claim (an upload in flight counts for the min-gap rule)."""
+        with self.connect() as c:
+            r = c.execute(
+                "SELECT MAX(t) AS m FROM (SELECT posted_at AS t FROM posts WHERE platform=? AND status='posted' "
+                "UNION ALL SELECT claimed_at FROM posts WHERE platform=? AND status='uploading' AND claimed_at>=?)",
+                (platform, platform, stale_before_iso),
+            ).fetchone()
+            return r["m"] if r and r["m"] else None
+
+    def has_posted(self, clip_id: str) -> bool:
+        """True when the clip is out on any platform (posted, or an upload is in flight): its file must never change."""
+        with self.connect() as c:
+            return c.execute("SELECT 1 FROM posts WHERE clip_id=? AND status IN ('posted','uploading') LIMIT 1", (clip_id,)).fetchone() is not None
 
     def release_claim(self, clip_id: str, platform: str) -> None:
         """Hand an `uploading` row back as `pending` (interrupted or declined upload: no verdict to record)."""

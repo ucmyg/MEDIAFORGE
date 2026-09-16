@@ -143,19 +143,46 @@ def _stage_select(video: Video, ing: download.Ingested, transcript: Transcript, 
     if not candidates:
         raise RuntimeError(f"no highlight candidates in a {transcript.duration:.0f}s transcript with {len(transcript.words())} words")
     out_dir = clips_dir(settings, video.id)
-    clips = [_upsert_clip(db, video.id, idx, c, out_dir) for idx, c in enumerate(sorted(candidates, key=lambda c: (c.start, c.end)))]
+    clips = _assign_clips(db, video.id, sorted(candidates, key=lambda c: (c.start, c.end)), out_dir)
     db.set_video_status(video.id, "selected")
     db.log("pipeline.select", f"{video.id}: {len(clips)} clip(s) " + ", ".join(f"{c.id}[{c.start:.1f}-{c.end:.1f}]" for c in clips))
     return clips
 
 
+def _protected(db: DB, clip: Clip) -> bool:
+    """A clip that is out on any platform (or being uploaded right now) must keep its id, bounds and file forever."""
+    return clip.status == "posted" or db.has_posted(clip.id)
+
+
+def _assign_clips(db: DB, video_id: str, candidates: list[Candidate], out_dir: Path) -> list[Clip]:
+    """Map candidates onto clip rows. Ids are `<video>_<idx>` in start order; a protected clip never changes, so a
+    new selection that does not match its bounds gets a fresh id after the highest existing one instead."""
+    existing = {c.id: c for c in db.list_clips(video_id)}
+    protected = {cid for cid, c in existing.items() if _protected(db, c)}
+    next_idx = max(len(candidates), max((c.idx for c in existing.values()), default=-1) + 1)  # never an id a later candidate takes
+    clips: list[Clip] = []
+    for idx, cand in enumerate(candidates):
+        match = next((existing[cid] for cid in protected if not _bounds_moved(existing[cid], cand)), None)
+        if match is not None:
+            clips.append(match)
+            continue
+        clip_id = clip_id_for(video_id, idx)
+        if clip_id in protected:
+            log.warning("clip %s is published; the new selection [%.1f-%.1f] gets a fresh id", clip_id, cand.start, cand.end)
+            idx, next_idx = next_idx, next_idx + 1
+        clips.append(_upsert_clip(db, video_id, idx, cand, out_dir))
+    seen = {c.id for c in clips}
+    clips.extend(existing[cid] for cid in sorted(protected) if cid not in seen)
+    return sorted(clips, key=lambda c: c.idx)
+
+
 def _upsert_clip(db: DB, video_id: str, idx: int, cand: Candidate, out_dir: Path) -> Clip:
-    """Insert/update the clip row for a candidate. A posted clip keeps its bounds (its file is already public); a clip
-    whose bounds moved drops its stale render so the render stage redoes it."""
+    """Insert/update the clip row for a candidate. A protected clip keeps its bounds (its file is already public); a
+    clip whose bounds moved drops its stale render so the render stage redoes it."""
     clip_id = clip_id_for(video_id, idx)
     existing = db.get_clip(clip_id)
-    if existing is not None and existing.status == "posted":
-        log.warning("clip %s is posted; keeping it instead of the new selection [%.1f-%.1f]", clip_id, cand.start, cand.end)
+    if existing is not None and _protected(db, existing):
+        log.warning("clip %s is published; keeping it instead of the new selection [%.1f-%.1f]", clip_id, cand.start, cand.end)
         return existing
     if existing is not None and _bounds_moved(existing, cand):
         log.info("clip %s moved [%.1f-%.1f] -> [%.1f-%.1f]; discarding its render", clip_id, existing.start, existing.end, cand.start, cand.end)
@@ -274,8 +301,8 @@ def _discard_clips(db: DB, settings: Settings, video_id: str) -> None:
     Posted clips (and clips referenced by any post row) are kept: their files are already out on a platform."""
     out_dir = clips_dir(settings, video_id)
     for clip in db.list_clips(video_id):
-        if clip.status == "posted":
-            log.warning("clip %s is posted; --force keeps it", clip.id)
+        if _protected(db, clip):
+            log.warning("clip %s is published on at least one platform; --force keeps its file and bounds", clip.id)
             continue
         _remove_clip_files(out_dir, clip.id)
     with db.connect() as c:

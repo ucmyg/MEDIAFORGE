@@ -84,7 +84,9 @@ RATE_LIMIT_STATUS = 429
 # code (access_token_invalid, scope_not_authorized, invalid_params, spam_risk_*, ...) is fatal for this attempt.
 RETRYABLE_ERROR_CODES = frozenset({"rate_limit_exceeded", "internal_error"})
 AUTH_ERROR_CODES = frozenset({"access_token_invalid"})  # account-level: the row is left untouched, re-run `clipforge auth tiktok`
-PUBLISH_ID_KEY = "tiktok.publish_id.{clip_id}"  # kv: publish_id whose upload completed but whose status is not final yet
+PUBLISH_ID_KEY = "tiktok.publish_id.{clip_id}"  # kv: JSON {publish_id, upload_url, chunk_size, uploaded} of an upload in flight; cleared only after mark_posted
+PRIVACY_LEVELS = ("SELF_ONLY", "MUTUAL_FOLLOW_FRIENDS", "FOLLOWER_OF_CREATOR", "PUBLIC_TO_EVERYONE")
+POSTING_CHOICES_DOC = "https://developers.tiktok.com/doc/content-sharing-guidelines"
 
 UNAUDITED_NOTE = "unaudited apps: SELF_ONLY, private account, <= 5 users / 24 h"
 SETUP_HELP = (
@@ -225,17 +227,27 @@ def pick_privacy(wanted: str, options: list[str]) -> str:
     raise PublishFatal(f"tiktok: privacy {wanted!r} not available and no {FALLBACK_PRIVACY} either; creator_info offers: {offered}")
 
 
-def init_body(caption: str, privacy: str, creator: dict[str, Any], video_size: int, chunk_size: int, total_chunks: int) -> dict[str, Any]:
-    """video/init request body; disable_* mirror the creator's *_disabled settings."""
+def init_body(caption: str, privacy: str, creator: dict[str, Any], video_size: int, chunk_size: int, total_chunks: int, cfg: TikTokCfg | None = None) -> dict[str, Any]:
+    """video/init request body. Interactions are OFF unless the user enabled them in config AND the creator allows
+    them (TikTok's guidelines: no auto-enabled interactions); commercial disclosure toggles only when declared."""
+    allow = {
+        "comment": bool(cfg.allow_comments) if cfg else False,
+        "duet": bool(cfg.allow_duet) if cfg else False,
+        "stitch": bool(cfg.allow_stitch) if cfg else False,
+    }
+    post_info: dict[str, Any] = {
+        "title": clamp_caption(caption),
+        "privacy_level": privacy,
+        "disable_duet": bool(creator.get("duet_disabled", False)) or not allow["duet"],
+        "disable_comment": bool(creator.get("comment_disabled", False)) or not allow["comment"],
+        "disable_stitch": bool(creator.get("stitch_disabled", False)) or not allow["stitch"],
+        "video_cover_timestamp_ms": COVER_TIMESTAMP_MS,
+    }
+    if cfg is not None and cfg.commercial_content:
+        post_info["brand_content_toggle"] = bool(cfg.branded_content)
+        post_info["brand_organic_toggle"] = bool(cfg.brand_organic)
     return {
-        "post_info": {
-            "title": clamp_caption(caption),
-            "privacy_level": privacy,
-            "disable_duet": bool(creator.get("duet_disabled", False)),
-            "disable_comment": bool(creator.get("comment_disabled", False)),
-            "disable_stitch": bool(creator.get("stitch_disabled", False)),
-            "video_cover_timestamp_ms": COVER_TIMESTAMP_MS,
-        },
+        "post_info": post_info,
         "source_info": {
             "source": SOURCE_FILE_UPLOAD,
             "video_size": video_size,
@@ -313,6 +325,7 @@ class TikTokPublisher(Publisher):
     def publish(self, clip: Clip, meta: ClipMeta) -> str:
         self.ensure_not_posted(clip)
         self.ensure_allowance()
+        self.check_posting_choices()  # a config gap is not a clip failure: nothing is recorded against the clip
         self.warn_once()
         self.db.ensure_post(clip.id, self.name)
         try:
@@ -324,6 +337,7 @@ class TikTokPublisher(Publisher):
             log.error("tiktok: publish %s failed: %s", clip.id, err)
             raise
         self.db.mark_posted(clip.id, self.name, post_id)
+        self.db.kv_delete(PUBLISH_ID_KEY.format(clip_id=clip.id))  # only now: success is on record
         self.db.log("publish", f"tiktok {clip.id} -> post {post_id}")
         log.info("tiktok: posted %s as %s", clip.id, post_id)
         return post_id
@@ -338,30 +352,80 @@ class TikTokPublisher(Publisher):
             raise PublishFatal(f"tiktok: clip file is empty: {path}")
         token = self._access_token()
         key = PUBLISH_ID_KEY.format(clip_id=clip.id)
-        resumed = self.db.kv_get(key)
-        if resumed:
-            log.info("tiktok: resuming publish_id=%s for %s (upload already complete; polling status only)", resumed, clip.id)
-            return self._finish_publish(token, key, resumed)
+        state = self._load_state(key)
+        if state:
+            return self._resume(token, key, state, path, size)
         creator = self._creator_info(token)
-        privacy = pick_privacy(self.cfg.privacy, [str(o) for o in creator.get("privacy_level_options") or []])
+        privacy = pick_privacy(str(self.cfg.privacy), [str(o) for o in creator.get("privacy_level_options") or []])
         chunk, total, ranges = chunk_plan(size, self.cfg.chunk_size, min_chunk=self._min_chunk)
-        init = self._api_call(INIT_URL, token, init_body(meta.caption_for(self.name), privacy, creator, size, chunk, total), "video/init")
+        init = self._api_call(INIT_URL, token, init_body(meta.caption_for(self.name), privacy, creator, size, chunk, total, self.cfg), "video/init")
         publish_id, upload_url = str(init.get("publish_id") or ""), str(init.get("upload_url") or "")
         if not publish_id or not upload_url:
             raise PublishFatal("tiktok video/init: response lacks publish_id or upload_url")
+        state = {"publish_id": publish_id, "upload_url": upload_url, "chunk_size": chunk, "uploaded": False}
+        self.db.kv_set(key, json.dumps(state))  # recorded before the first byte: a retry resumes this init, never starts a second one
         log.info("tiktok: uploading %s (%d bytes, %d chunk(s), %s) publish_id=%s", path.name, size, total, privacy, publish_id)
         self._upload(path, upload_url, ranges, size)
-        self.db.kv_set(key, publish_id)  # point of no return: TikTok has the whole video and will publish it
+        state["uploaded"] = True
+        self.db.kv_set(key, json.dumps(state))
         return self._finish_publish(token, key, publish_id)
 
+    def check_posting_choices(self) -> None:
+        """TikTok's guidelines require the user to choose privacy and interactions and to accept the music terms."""
+        if not self.cfg.privacy:
+            raise PublishFatal(
+                "tiktok: choose who can view the post first - set platforms.tiktok.privacy to one of "
+                f"{', '.join(PRIVACY_LEVELS)} (the UI's Publish tab has the form); TikTok forbids a default ({POSTING_CHOICES_DOC})"
+            )
+        if not self.cfg.music_usage_confirmed:
+            raise PublishFatal("tiktok: accept TikTok's Music Usage Confirmation first (platforms.tiktok.music_usage_confirmed: true)")
+        if self.cfg.commercial_content and self.cfg.branded_content and self.cfg.privacy == "SELF_ONLY":
+            raise PublishFatal("tiktok: branded content cannot be posted as SELF_ONLY; choose a wider privacy level or untick branded content")
+
+    def _load_state(self, key: str) -> dict[str, Any] | None:
+        raw = self.db.kv_get(key)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+        except ValueError:  # pre-JSON format: a bare publish_id whose upload had completed
+            data = {"publish_id": raw, "upload_url": "", "chunk_size": self.cfg.chunk_size, "uploaded": True}
+        return data if isinstance(data, dict) and data.get("publish_id") else None
+
+    def _resume(self, token: str, key: str, state: dict[str, Any], path: Path, size: int) -> str:
+        """Continue an init recorded by an earlier attempt instead of creating a second post for the same clip."""
+        publish_id = str(state["publish_id"])
+        if not state.get("uploaded"):
+            status = self._status(token, publish_id)
+            log.info("tiktok: resuming publish_id=%s for %s (status %s)", publish_id, path.name, status or "unknown")
+            if status == STATUS_FAILED:
+                self.db.kv_delete(key)
+                raise PublishError(f"tiktok: the interrupted upload {publish_id} was rejected; the next attempt starts a new one")
+            if status in ("", "PROCESSING_UPLOAD"):  # bytes still missing: PUTs by byte range are idempotent on the same URL
+                _, _, ranges = chunk_plan(size, int(state.get("chunk_size") or self.cfg.chunk_size), min_chunk=self._min_chunk)
+                try:
+                    self._upload(path, str(state["upload_url"]), ranges, size)
+                except PublishFatal as err:  # the upload URL no longer accepts data: that init can never complete
+                    self.db.kv_delete(key)
+                    raise PublishError(f"tiktok: could not resume upload {publish_id} ({err}); the next attempt starts a new one") from err
+            state["uploaded"] = True
+            self.db.kv_set(key, json.dumps(state))
+        else:
+            log.info("tiktok: resuming publish_id=%s for %s (upload complete; polling status)", publish_id, path.name)
+        return self._finish_publish(token, key, publish_id)
+
+    def _status(self, token: str, publish_id: str) -> str:
+        data = self._api_call(STATUS_URL, token, {"publish_id": publish_id}, "status/fetch")
+        return str(data.get("status") or "")
+
     def _finish_publish(self, token: str, key: str, publish_id: str) -> str:
-        """Poll until the outcome is known and clear the stored publish_id then; a retryable error leaves it for a resume."""
+        """Poll until the outcome is known. The stored state survives until publish() has recorded success, so a
+        crash or DB error after PUBLISH_COMPLETE resumes with a status poll instead of a second upload."""
         try:
             done = self._wait_for_publish(token, publish_id)
         except PublishRejected:
             self.db.kv_delete(key)
             raise
-        self.db.kv_delete(key)
         ids = done.get(POST_ID_FIELD) or []
         return str(ids[0]) if ids else publish_id
 

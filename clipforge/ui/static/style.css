@@ -312,3 +312,7 @@ dialog p { margin: 0; }
   .toast { animation: none; transition: none; }
   .progress > span { transition: none; }
 }
+
+/* TikTok posting choices */
+.posting-form { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border, rgba(128,128,128,.3)); display: grid; gap: 10px; }
+.posting-form h3 { margin: 0; font-size: 1rem; }

@@ -5,6 +5,8 @@ import os
 import shutil
 from pathlib import Path
 
+os.environ.setdefault("COLUMNS", "200")  # rich wraps at the terminal width; keep CLI output assertions stable everywhere
+
 import pytest
 
 ROOT = Path(__file__).resolve().parent

@@ -7,7 +7,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from functools import lru_cache
 
 from ..config import Settings
-from ..db import DB, Clip
+from ..db import CLAIM_STALE_S, DB, Clip
 from ..log import console, get_logger
 from ..metadata import ClipMeta
 
@@ -128,10 +128,18 @@ class Publisher(ABC):
         """Budget day key (YYYY-MM-DD in budget_tz())."""
         return datetime.now(self.budget_tz()).strftime("%Y-%m-%d")
 
+    def day_start_iso(self) -> str:
+        """UTC ISO timestamp of today_key()'s midnight in budget_tz() (posted_at / claimed_at are stored as UTC ISO)."""
+        start = datetime.strptime(self.today_key(), "%Y-%m-%d").replace(tzinfo=self.budget_tz())
+        return start.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+    def stale_before_iso(self) -> str:
+        return (datetime.now(timezone.utc) - timedelta(seconds=CLAIM_STALE_S)).isoformat(timespec="seconds")
+
     def posted_today(self) -> int:
-        """Posts whose posted_at (UTC ISO) falls on today_key() in the platform's budget zone."""
-        day, tz = self.today_key(), self.budget_tz()
-        return len([p for p in self.db.list_posts(self.name, "posted") if p.posted_at and _day_in(p.posted_at, tz) == day])
+        """Posts completed today (budget zone) plus uploads another process is holding a live claim on right now, so
+        two schedulers cannot both count the same free slot."""
+        return self.db.count_active(self.name, self.day_start_iso(), self.stale_before_iso())
 
     def warn_once(self, key: str | None = None, message: str | None = None) -> None:
         """Print a loud warning the first time (per workspace DB) and log it; later calls only log at debug level."""

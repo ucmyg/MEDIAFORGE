@@ -28,7 +28,7 @@ from typing import Callable, Sequence
 
 from . import pipeline
 from .config import Settings
-from .db import DB, Clip
+from .db import CLAIM_STALE_S, DB, Clip
 from .log import console, get_logger
 from .metadata import ClipMeta, read_meta
 from .publish import PLATFORMS, get_publisher
@@ -40,7 +40,8 @@ TIME_FORMAT = "%H:%M"  # schedule.times entries, local wall-clock
 DRY_RUN_POST_ID = ""  # post id recorded in TickResult.posted for a dry run (nothing was sent)
 LOG_ACTIONS = {"schedule": ("schedule.posted", "schedule.failed"), "publish": ("publish.posted", "publish.failed")}
 COOLDOWN_KEY = "sched.{platform}.cooldown_until"  # kv: platform-level backoff after any failure (UTC ISO)
-CLAIM_STALE = timedelta(hours=3)  # an `uploading` claim older than this belongs to a dead process and may be taken over
+CLAIM_STALE = timedelta(seconds=CLAIM_STALE_S)  # an `uploading` claim older than this belongs to a dead process and may be taken over
+PUBLISHABLE = ("rendered", "ready", "posted")  # never rejected/failed/candidate: re-checked under the claim
 
 
 class InProgress(RuntimeError):
@@ -199,7 +200,7 @@ def _active_publishers(
 
 def _tick_platform(settings: Settings, db: DB, publisher: Publisher, times: list[time], now: datetime, active: list[str], result: TickResult) -> None:
     name = publisher.name
-    last_iso = db.last_posted_at(name)
+    last_iso = db.latest_activity(name, _iso_utc(now - CLAIM_STALE))  # completed posts and uploads in flight
     last = _parse_ts(last_iso, now.tzinfo) if last_iso else None
     slot = due_slot(now, times, last)
     if slot is None:
@@ -310,8 +311,25 @@ def publish_clip(settings: Settings, db: DB, publisher: Publisher, clip: Clip, a
     publisher.ensure_allowance()
     row = db.ensure_post(clip.id, name)
     attempts_before = row.attempts
-    if not db.claim_post(clip.id, name, _iso_utc(now), _iso_utc(now - CLAIM_STALE)):
+    verdict = db.reserve_and_claim(
+        clip.id,
+        name,
+        _iso_utc(now),
+        _iso_utc(now - CLAIM_STALE),
+        day_start_iso=_day_start_iso(publisher, now),
+        per_day=_per_day(settings, name, publisher),
+        gap_before_iso=_iso_utc(now - timedelta(hours=settings.schedule.min_gap_h)) if source == "schedule" else None,
+    )
+    if verdict == "busy":
         raise InProgress(f"{name}: clip {clip.id} is being posted by another clipforge process")
+    if verdict == "per_day":
+        raise InProgress(f"{name}: daily allowance reserved by another clipforge process ({_per_day(settings, name, publisher)} per day)")
+    if verdict == "gap":
+        raise InProgress(f"{name}: another clipforge process posted within the last {settings.schedule.min_gap_h:g} h")
+    current = db.get_clip(clip.id)  # re-read under the claim: a rejection that landed after the job was queued wins
+    if current is None or current.status not in PUBLISHABLE:
+        _discard_attempt(db, row)
+        raise PublishFatal(f"{name}: clip {clip.id} is {'gone' if current is None else current.status}; not publishing")
     try:
         post_id = publisher.publish(clip, _load_meta(clip))
     except NotConfirmed:  # a decline is not an attempt (manual.py contract): no attempts, no backoff, no row
@@ -325,6 +343,25 @@ def publish_clip(settings: Settings, db: DB, publisher: Publisher, clip: Clip, a
         raise
     _record_success(db, clip, name, post_id, active, source)
     return post_id
+
+
+def _per_day(settings: Settings, platform: str, publisher: Publisher | None = None) -> int:
+    """The per-day cap the reservation enforces: the publisher's own view of it (limits()), else the config."""
+    if publisher is not None:
+        try:
+            return int(publisher.limits().per_day)
+        except Exception:  # limits() failing must not block a post the publisher itself will re-check
+            pass
+    cfg = getattr(settings.platforms, platform, None)
+    return int(getattr(cfg, "per_day", -1)) if cfg is not None else -1
+
+
+def _day_start_iso(publisher: Publisher, now: datetime) -> str:
+    """Today's midnight in the publisher's budget zone as UTC ISO (matches the stored posted_at / claimed_at format)."""
+    fn = getattr(publisher, "day_start_iso", None)
+    if fn is not None:
+        return str(fn())
+    return _iso_utc(now.replace(hour=0, minute=0, second=0, microsecond=0))
 
 
 def _discard_attempt(db: DB, row) -> None:

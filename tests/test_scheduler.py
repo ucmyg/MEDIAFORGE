@@ -464,7 +464,7 @@ def test_manual_decline_is_not_an_attempt(sched: Sched, monkeypatch):
 def test_claim_keeps_two_processes_from_posting_the_same_clip(sched: Sched):
     pub = sched.publishers["youtube"]
     sched.add_ready("vid_00", "vid_01")
-    other_now = at("09:04")  # "the other process" (a concurrent `publish --now`) claimed vid_00 a minute ago
+    other_now = at("06:35")  # "the other process" (a concurrent `publish --now`) claimed vid_00 2.5 h ago: still live (< 3 h stale), outside the 2 h gap
     sched.db.ensure_post("vid_00", "youtube")
     assert sched.db.claim_post("vid_00", "youtube", S._iso_utc(other_now), S._iso_utc(other_now - S.CLAIM_STALE))
     with pytest.raises(S.InProgress, match="another clipforge process"):
@@ -644,3 +644,34 @@ def test_daemon_stops_on_keyboard_interrupt(sched: Sched, monkeypatch, capsys):
 
     assert S.daemon(sched.settings, sched.db, sleep=interrupt) == 1
     assert "stopped" in capsys.readouterr().out
+
+
+# ---- review fixes: approval re-check and atomic capacity reservation ------------------------------------------------
+def test_rejection_after_queueing_cancels_the_upload(sched: Sched):
+    """A publish job was queued, then the reviewer rejected the clip: the claim re-reads the row and stands down."""
+    pub = sched.publishers["youtube"]
+    sched.add_ready("vid_00")
+    sched.db.set_clip_status("vid_00", "rejected")
+    with pytest.raises(PublishFatal, match="is rejected"):
+        S.publish_clip(sched.settings, sched.db, pub, sched.ready[0], ["youtube"], now=at("09:05"), source="publish")
+    assert pub.calls == [] and sched.post("vid_00", "youtube") is None  # nothing attempted, nothing recorded
+
+
+def test_capacity_is_reserved_inside_the_claim(sched: Sched):
+    """Two schedulers with per_day=1: the second counts the first's in-flight upload and stands down (no double post)."""
+    pub = sched.publishers["youtube"]
+    pub.per_day = 1
+    sched.add_ready("vid_00", "vid_01")
+    other_now = at("09:04")  # another process claimed vid_00 a minute ago and is still uploading
+    sched.db.ensure_post("vid_00", "youtube")
+    assert sched.db.claim_post("vid_00", "youtube", S._iso_utc(other_now), S._iso_utc(other_now - S.CLAIM_STALE))
+    res = sched.tick("09:05")
+    assert res.posted == [] and pub.calls == [] and res.skipped, res.skipped  # the in-flight upload already owns the 09:00 slot
+    with pytest.raises(S.InProgress, match="allowance reserved"):
+        S.publish_clip(sched.settings, sched.db, pub, sched.ready[1], ["youtube"], now=at("09:05"), source="publish")
+    assert sched.post("vid_01", "youtube").status == "pending" and sched.post("vid_01", "youtube").attempts == 0
+    # once the other upload is old enough for the gap but still live, the per-day reservation still blocks the tick
+    with sched.db.connect() as c:
+        c.execute("UPDATE posts SET claimed_at=? WHERE clip_id='vid_00'", (S._iso_utc(at("06:35")),))
+    res = sched.tick("09:05")
+    assert res.posted == [] and any("allowance reserved" in r for r in res.skipped), res.skipped

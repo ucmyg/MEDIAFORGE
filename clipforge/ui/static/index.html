@@ -145,6 +145,37 @@
             </form>
           </div>
           <pre class="form-error" id="tiktok-error" role="alert" hidden></pre>
+          <form id="tiktok-posting" class="posting-form">
+            <h3>Posting choices</h3>
+            <p class="muted small">TikTok requires you to pick these yourself; they apply to every Direct Post and are saved to clipforge.yaml.</p>
+            <div class="field">
+              <label for="tt-privacy">Who can view this video</label>
+              <select id="tt-privacy" name="privacy">
+                <option value="">choose...</option>
+                <option value="SELF_ONLY">Only me (SELF_ONLY)</option>
+                <option value="MUTUAL_FOLLOW_FRIENDS">Friends (MUTUAL_FOLLOW_FRIENDS)</option>
+                <option value="FOLLOWER_OF_CREATOR">Followers (FOLLOWER_OF_CREATOR)</option>
+                <option value="PUBLIC_TO_EVERYONE">Everyone (PUBLIC_TO_EVERYONE)</option>
+              </select>
+            </div>
+            <div class="row wrap">
+              <label class="check"><input type="checkbox" name="allow_comments"> allow comments</label>
+              <label class="check"><input type="checkbox" name="allow_duet"> allow duet</label>
+              <label class="check"><input type="checkbox" name="allow_stitch"> allow stitch</label>
+            </div>
+            <div class="row wrap">
+              <label class="check"><input type="checkbox" name="commercial_content" id="tt-commercial"> this content promotes a brand, product or service</label>
+            </div>
+            <div class="row wrap" id="tt-disclosure">
+              <label class="check"><input type="checkbox" name="brand_organic"> your brand (your own business)</label>
+              <label class="check"><input type="checkbox" name="branded_content"> branded content (paid partnership; cannot be Only me)</label>
+            </div>
+            <div class="row wrap">
+              <label class="check"><input type="checkbox" name="music_usage_confirmed"> I accept TikTok's Music Usage Confirmation for the content I post</label>
+            </div>
+            <div class="row"><button class="btn btn-primary" type="submit">Save TikTok posting choices</button><span class="muted small" id="tiktok-posting-status"></span></div>
+            <pre class="form-error" id="tiktok-posting-error" role="alert" hidden></pre>
+          </form>
         </section>
       </div>
 

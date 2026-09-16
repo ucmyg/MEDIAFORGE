@@ -422,6 +422,9 @@ def _scheduler_block(st: Any) -> dict[str, Any]:
     }
 
 
+TIKTOK_POSTING_KEYS = ("privacy", "allow_comments", "allow_duet", "allow_stitch", "commercial_content", "brand_organic", "branded_content", "music_usage_confirmed")
+
+
 def _settings_block(settings: Settings) -> dict[str, Any]:
     return {
         "style": settings.style,
@@ -431,6 +434,7 @@ def _settings_block(settings: Settings) -> dict[str, Any]:
         "punch": settings.punch,
         "clips": {"count": settings.clips.count, "min_s": settings.clips.min_s, "max_s": settings.clips.max_s},
         "styles": sorted({**DEFAULT_STYLES, **settings.styles}),
+        "tiktok": settings.platforms.tiktok.model_dump(include=set(TIKTOK_POSTING_KEYS)),
         "workspace": str(settings.workspace_dir.absolute()),
         "config_path": str(_config_path()),
     }
@@ -504,8 +508,11 @@ def _publish_fn(app: FastAPI, clip_ids: list[str], platforms: list[str]) -> Call
                 outcomes.extend(outcome(cid, name, "not configured", reason) for cid in clip_ids)
         active = list(publishers)
         for clip_id in clip_ids:
-            clip = db.get_clip(clip_id)
             for name, publisher in publishers.items():
+                clip = db.get_clip(clip_id)  # fresh each time: a rejection since the job was queued must win
+                if clip is not None and clip.status not in S.PUBLISHABLE:
+                    outcomes.append(outcome(clip_id, name, "error", f"clip is {clip.status}; approve it first"))
+                    continue
                 if clip is None:
                     outcomes.append(outcome(clip_id, name, "error", "clip no longer exists"))
                     continue
@@ -855,6 +862,27 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one closure per rout
         if path.is_file():
             return {"path": str(path), "yaml": path.read_text(encoding="utf-8"), "exists": True}
         return {"path": str(path), "yaml": _settings_yaml(st.settings), "exists": False}
+
+    @app.put("/api/platforms/tiktok")
+    def put_tiktok_posting(body: dict[str, Any]) -> dict[str, Any]:
+        """TikTok's posting choices (privacy, interactions, disclosure, music consent) written into clipforge.yaml."""
+        unknown = sorted(set(body) - set(TIKTOK_POSTING_KEYS))
+        if unknown:
+            raise HTTPException(400, f"unknown key(s): {', '.join(unknown)}")
+        path = _config_path()
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) if path.is_file() else None
+        if not isinstance(data, dict):  # no file yet: start from the live settings so nothing else changes
+            data = st.settings.model_dump(mode="json")
+        section = data.setdefault("platforms", {}).setdefault("tiktok", {})
+        if not isinstance(section, dict):
+            raise HTTPException(400, "platforms.tiktok in the YAML is not a mapping")
+        section.update({k: (None if v == "" else v) for k, v in body.items()})
+        try:
+            Settings(**data)
+        except ValidationError as err:
+            raise HTTPException(400, str(err)) from None
+        text = yaml.safe_dump(data, sort_keys=False)
+        return put_settings_file(SettingsBody(yaml=text))
 
     @app.put("/api/settings")
     def put_settings_file(body: SettingsBody) -> dict[str, Any]:

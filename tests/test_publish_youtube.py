@@ -136,15 +136,16 @@ def meta(**overrides) -> ClipMeta:
 def test_limits_arithmetic(publisher: YouTubePublisher, settings, db: DB):
     lim = publisher.limits()
     assert (lim.per_day, lim.posted_today, lim.remaining, lim.quota_used, lim.quota_total) == (3, 0, 3, 0, 10000)
-    assert lim.note == "quota 0/10000 units" and not lim.exhausted
+    assert lim.note == "uploads 0/100 today, quota 0/10000 units" and not lim.exhausted
 
     for cid in ("vid_01", "vid_02"):
         make_clip(settings, db, cid)
         db.mark_posted(cid, "youtube", f"id-{cid}")
     db.budget_add("youtube", FROZEN_DAY, 3200)
     lim = publisher.limits()
-    assert (lim.posted_today, lim.remaining, lim.quota_used) == (2, 1, 3200) and lim.note == "quota 3200/10000 units"
+    assert (lim.posted_today, lim.remaining, lim.quota_used) == (2, 1, 3200) and lim.note == "uploads 2/100 today, quota 3200/10000 units"
 
+    publisher.cfg.upload_cost = 1600  # unit budget binds under the old cost model
     db.budget_add("youtube", FROZEN_DAY, 5800)  # 9000 used -> 1000 left < one upload
     lim = publisher.limits()
     assert lim.remaining == 0 and lim.exhausted
@@ -154,7 +155,11 @@ def test_limits_arithmetic(publisher: YouTubePublisher, settings, db: DB):
 
 def test_limits_quota_bound_beats_per_day(publisher: YouTubePublisher):
     publisher.cfg.per_day = 10
+    publisher.cfg.upload_cost = 1600  # the pre-2025 quota model: 1600 units per insert out of 10000
     assert publisher.limits().remaining == 6  # 10000 // 1600
+    publisher.cfg.upload_cost = 1
+    publisher.cfg.uploads_per_day = 4  # the upload bucket (calls per day) binds when it is the smallest
+    assert publisher.limits().remaining == 4
 
 
 def test_posted_today_counts_in_the_pacific_day(publisher: YouTubePublisher, settings, db: DB, monkeypatch):
@@ -203,7 +208,7 @@ def test_publish_happy_path(publisher: YouTubePublisher, db: DB, clip: Clip, use
     assert db.is_posted(clip.id, "youtube")
     post = db.get_post(clip.id, "youtube")
     assert post.status == "posted" and post.post_id == "abc123" and post.posted_at == FROZEN_TS
-    assert db.budget_used("youtube", FROZEN_DAY) == 1600
+    assert db.budget_used("youtube", FROZEN_DAY) == publisher.cfg.upload_cost
     assert publisher.limits().posted_today == 1
     assert any(r["action"] == "publish.youtube" and "abc123" in r["detail"] for r in db.recent_log())
     out = capsys.readouterr().out
@@ -212,7 +217,7 @@ def test_publish_happy_path(publisher: YouTubePublisher, db: DB, clip: Clip, use
 
     with pytest.raises(PublishFatal, match="already posted"):
         publisher.publish(clip, meta())
-    assert db.budget_used("youtube", FROZEN_DAY) == 1600 and len(db.list_posts("youtube")) == 1
+    assert db.budget_used("youtube", FROZEN_DAY) == publisher.cfg.upload_cost and len(db.list_posts("youtube")) == 1
     assert "read this once" not in capsys.readouterr().out
 
 

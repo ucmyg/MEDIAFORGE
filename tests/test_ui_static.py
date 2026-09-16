@@ -33,6 +33,7 @@ CONTRACT_PATHS = [
     r"/api/doctor",
     r"/api/logs",
     r"/api/settings",
+    r"/api/platforms/tiktok",
 ]
 CONTRACT_RE = re.compile("^(?:" + "|".join(CONTRACT_PATHS) + ")$")
 

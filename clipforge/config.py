@@ -106,8 +106,9 @@ class YouTubeCfg(BaseModel):
     privacy: Literal["private", "unlisted", "public"] = "private"
     category: str = "22"  # People & Blogs
     per_day: int = 3
-    upload_cost: int = 1600  # quota units per videos.insert (Data API v3 docs, verify in doctor)
-    daily_quota: int = 10000  # default project quota units per day
+    upload_cost: int = 1  # quota units per videos.insert (current docs: uploads have their own bucket at 1 unit each; older docs said 1600)
+    daily_quota: int = 10000  # project quota units per day (general bucket)
+    uploads_per_day: int = 100  # videos.insert calls allowed per day (the separate upload bucket); verify at developers.google.com/youtube/v3/docs/videos/insert
     publish_at: str | None = None  # RFC3339, only honoured with privacy=private (scheduled publish)
     client_secret: str = "client_secret.json"
     token_file: str = "youtube_token.json"  # relative paths resolve under paths.workspace
@@ -115,8 +116,15 @@ class YouTubeCfg(BaseModel):
 
 
 class TikTokCfg(BaseModel):
-    privacy: str = "SELF_ONLY"  # must be one of creator_info/query privacy_level_options
+    privacy: str | None = None  # TikTok requires an explicit choice: one of creator_info/query privacy_level_options (e.g. SELF_ONLY)
     per_day: int = 2
+    allow_comments: bool = False  # interaction settings default OFF per TikTok's guidelines; the user enables them
+    allow_duet: bool = False
+    allow_stitch: bool = False
+    commercial_content: bool = False  # content discloses a commercial relationship (enables the toggles below)
+    brand_organic: bool = False  # "Your brand": promotes the creator's own business
+    branded_content: bool = False  # "Branded content": paid partnership (TikTok forces non-private privacy for it)
+    music_usage_confirmed: bool = False  # you accepted TikTok's Music Usage Confirmation; required before any Direct Post
     client_key: str = ""
     client_secret: str = ""
     redirect_uri: str = ""  # any redirect URI registered on the app; paste-back flow

@@ -346,13 +346,14 @@ class YouTubePublisher(Publisher):
         used = self.db.budget_used(self.name, self.today_key())
         by_quota = max(0, cfg.daily_quota - used) // max(cfg.upload_cost, 1)
         posted = self.posted_today()
+        by_uploads = max(0, cfg.uploads_per_day - posted)
         return Limits(
             per_day=cfg.per_day,
             posted_today=posted,
-            remaining=max(0, min(cfg.per_day - posted, by_quota)),
+            remaining=max(0, min(cfg.per_day - posted, by_quota, by_uploads)),
             quota_used=used,
             quota_total=cfg.daily_quota,
-            note=f"quota {used}/{cfg.daily_quota} units",
+            note=f"uploads {posted}/{cfg.uploads_per_day} today, quota {used}/{cfg.daily_quota} units",
         )
 
     # ---- publish -------------------------------------------------------
