@@ -800,9 +800,9 @@ def test_setup_logging_replaces_the_file_handler(tmp_path: Path):
     file_handlers = lambda: [h for h in root.handlers if isinstance(h, logging.handlers.RotatingFileHandler)]  # noqa: E731
     setup_logging(tmp_path / "logs1")
     setup_logging(tmp_path / "logs1")
-    assert len(file_handlers()) == 1 and Path(file_handlers()[0].baseFilename) == (tmp_path / "logs1" / "clipforge.log").resolve()
+    assert {Path(h.baseFilename) for h in file_handlers()} == {(tmp_path / "logs1" / "clipforge.log").resolve(), (tmp_path / "logs1" / "clipforge.jsonl").resolve()}
     setup_logging(tmp_path / "logs2")  # a new logs dir (the UI reloaded a saved config): the old file is closed, not doubled
-    assert len(file_handlers()) == 1 and Path(file_handlers()[0].baseFilename) == (tmp_path / "logs2" / "clipforge.log").resolve()
+    assert {Path(h.baseFilename) for h in file_handlers()} == {(tmp_path / "logs2" / "clipforge.log").resolve(), (tmp_path / "logs2" / "clipforge.jsonl").resolve()}
     logging.getLogger("clipforge.test").info("only in logs2")
     for h in file_handlers():
         h.flush()
@@ -1015,3 +1015,50 @@ def test_every_response_carries_a_request_id_and_access_log_line(api: TestClient
     assert loud and loud[0].levelno == _logging.INFO and "?" not in loud[0].getMessage()  # no query strings ever
     res = api.get("/api/state", params={"video": "secret-looking-value"})
     assert "secret-looking-value" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+# ---- production polish: 404 page, gzip, run dedupe, JSON logs ---------------------------------------------------------
+def test_unknown_paths_get_html_for_browsers_and_json_for_the_api(api: TestClient):
+    page = api.get("/nowhere", headers={"Accept": "text/html,application/xhtml+xml"})
+    assert page.status_code == 404 and "text/html" in page.headers["content-type"] and "Open ClipForge" in page.text
+    assert api.get("/api/nowhere", headers={"Accept": "text/html"}).json() == {"detail": "Not Found"}
+    assert api.get("/nowhere").status_code == 404 and api.get("/nowhere").headers["content-type"].startswith("application/json")
+
+
+def test_state_is_gzipped_for_clients_that_accept_it(api: TestClient, settings: Settings, db: DB):
+    for i in range(30):
+        stub_clip(db, settings.workspace_dir, f"vid_{i:02d}", idx=i)
+    res = api.get("/api/state", headers={"Accept-Encoding": "gzip"})
+    assert res.status_code == 200 and res.headers.get("content-encoding") == "gzip" and len(res.json()["clips"]) == 30
+
+
+def test_run_requests_are_deduplicated_while_pending(api: TestClient, settings: Settings, db: DB, monkeypatch):
+    import threading
+
+    stub_clip(db, settings.workspace_dir, "vid_00")
+    gate = threading.Event()
+    monkeypatch.setattr(pipeline, "process_queue", lambda *_a, **_k: (gate.wait(5), [])[1])
+    monkeypatch.setattr(pipeline, "process_video", lambda *_a, **_k: (gate.wait(5), pipeline.ProcessReport(VID, "done", []))[1])
+    first = api.post("/api/run").json()
+    second = api.post("/api/run").json()
+    assert second["job_id"] == first["job_id"] and second.get("existing") == "true"
+    v1 = api.post(f"/api/videos/{VID}/run", json={}).json()
+    v2 = api.post(f"/api/videos/{VID}/run", json={}).json()
+    forced = api.post(f"/api/videos/{VID}/run", json={"force": True}).json()
+    assert v2["job_id"] == v1["job_id"] and forced["job_id"] != v1["job_id"]
+    gate.set()
+    wait_job(api, first["job_id"])
+    later = api.post("/api/run").json()
+    assert later["job_id"] != first["job_id"]  # finished jobs never absorb a new request
+    wait_job(api, later["job_id"])
+
+
+def test_json_log_lines_carry_request_fields(api: TestClient, settings: Settings):
+    from clipforge.log import setup_logging
+
+    setup_logging(settings.logs_dir)
+    api.get("/api/doctor")
+    lines = [json.loads(l) for l in (settings.logs_dir / "clipforge.jsonl").read_text(encoding="utf-8").splitlines() if l.strip()]
+    access = [l for l in lines if l.get("route") == "/api/doctor"]
+    assert access and {"ts", "level", "logger", "msg", "rid", "method", "route", "status", "ms"} <= set(access[-1])
+    assert access[-1]["status"] == 200 and isinstance(access[-1]["ms"], (int, float))

@@ -1,8 +1,10 @@
 """Logging setup: rich console + rotating file under paths.logs. Every module uses get_logger(__name__)."""
 from __future__ import annotations
 
+import json
 import logging
 import logging.handlers
+from datetime import datetime, timezone
 from pathlib import Path
 
 from rich.console import Console
@@ -41,6 +43,32 @@ def setup_logging(log_dir: str | Path | None = None, level: int = logging.INFO) 
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
         root.addHandler(fh)
+        jh = logging.handlers.RotatingFileHandler(target.with_suffix(".jsonl"), maxBytes=2_000_000, backupCount=3, encoding="utf-8")
+        jh.setLevel(logging.INFO)
+        jh.setFormatter(JsonFormatter())
+        root.addHandler(jh)
+
+
+_STD_ATTRS = set(vars(logging.LogRecord("", 0, "", 0, "", (), None))) | {"message", "asctime", "taskName"}
+
+
+class JsonFormatter(logging.Formatter):
+    """One JSON object per line: ts, level, logger, msg plus any `extra=` fields (request id, route, status, ms).
+    Exceptions are rendered as text; nothing else is added, so what is logged is what the code passed."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        data = {
+            "ts": datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="milliseconds"),
+            "level": record.levelname,
+            "logger": record.name,
+            "msg": record.getMessage(),
+        }
+        for key, value in record.__dict__.items():
+            if key not in _STD_ATTRS and not key.startswith("_"):
+                data[key] = value if isinstance(value, (str, int, float, bool)) or value is None else str(value)
+        if record.exc_info:
+            data["exc"] = self.formatException(record.exc_info)
+        return json.dumps(data, ensure_ascii=False)
 
 
 def console_level() -> int:

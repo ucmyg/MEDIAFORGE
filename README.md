@@ -300,7 +300,8 @@ real whisper `tiny` model skips itself when the model cannot be downloaded.
   not reached yet; `publish --now` refuses to double-post ("already posted") and a running daemon and `publish --now`
   claim a clip before uploading, so they never upload the same one twice.
 * **Manual/browser** publishers do not enforce `per_day` (a human is in the loop) but report it in `limits()`.
-* **Logs** go to `logs/` (configurable, gitignored); the workspace is gitignored too.
+* **Logs** go to `logs/` (configurable, gitignored): `clipforge.log` (text) and `clipforge.jsonl` (one JSON object per line
+  with request id, route, status and duration for the UI's access log); the workspace is gitignored too.
 * **Layout.** Assets live in `assets/{fonts,music}` at the repo root (editable install). A non-editable install points
   `paths.assets` at a folder containing `fonts/` and `music/`; `doctor` fails loudly when no font is found.
 

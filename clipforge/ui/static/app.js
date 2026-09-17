@@ -237,7 +237,8 @@
     }
     return `${res.status} ${res.statusText || ''}`.trim();
   }
-  const API_TIMEOUT_MS = 30000; // most calls answer in milliseconds; doctor and settings reloads get longer budgets
+  const API_TIMEOUT_MS = 15000; // most calls answer in milliseconds; doctor and settings reloads get longer budgets
+  const GET_RETRY_MS = 600; // one jittered retry for idempotent reads that failed on the network
   async function api(method, path, body, opts) {
     // X-ClipForge: the server refuses POST/PUT/DELETE without it, so a cross-site page cannot drive the API without a CORS preflight
     const timeoutMs = (opts && opts.timeoutMs) || API_TIMEOUT_MS;
@@ -248,8 +249,14 @@
     let res;
     try { res = await fetch(path, init); } catch (err) {
       clearTimeout(timer);
+      const timedOut = err && err.name === 'AbortError';
+      if (method === 'GET' && !(opts && opts.noRetry)) {
+        // idempotent read: one more try after a short jittered pause (a mutation is never retried blindly)
+        await new Promise((r) => setTimeout(r, GET_RETRY_MS + Math.random() * GET_RETRY_MS));
+        return api(method, path, body, { ...(opts || {}), noRetry: true });
+      }
       // a timed-out mutation may still have been applied server-side: the next poll shows the truth
-      const e = new Error(err && err.name === 'AbortError' ? `no answer after ${Math.round(timeoutMs / 1000)} s` : 'server unreachable');
+      const e = new Error(timedOut ? `this is taking too long (no answer after ${Math.round(timeoutMs / 1000)} s); check the ClipForge window` : 'server unreachable');
       e.network = true;
       throw e;
     }
@@ -304,6 +311,7 @@
       S.failing = false;
       setOffline(false);
       if (gen === S.gen) { S.state = normaliseState(state); render(); checkWatchers(); }
+      if (document.body.dataset.loaded !== 'true') document.body.dataset.loaded = 'true';
     } catch (err) {
       S.failing = true;
       setOffline(true);
@@ -1259,6 +1267,24 @@
   }
 
   // ==== wiring =========================================================================================================
+  function showFatal(message) {
+    let box = document.getElementById('fatal');
+    if (!box) {
+      box = h('div', { id: 'fatal', class: 'fatal', role: 'alert' },
+        h('span', {}, ''),
+        h('button', { class: 'btn btn-sm', type: 'button', onclick: () => location.reload() }, 'Reload'),
+        h('button', { class: 'btn btn-sm', type: 'button', onclick: () => box.remove() }, 'Dismiss'));
+      document.body.appendChild(box);
+    }
+    box.firstChild.textContent = `Something went wrong: ${message}`;
+  }
+  window.addEventListener('error', (ev) => showFatal((ev.error && ev.error.message) || ev.message || 'unknown error'));
+  window.addEventListener('unhandledrejection', (ev) => {
+    const r = ev.reason;
+    if (r && r.network) return; // already surfaced as a toast / offline banner by the caller
+    showFatal((r && r.message) || String(r));
+  });
+
   function init() {
     initTabs();
     $('#add-form').addEventListener('submit', addVideo);

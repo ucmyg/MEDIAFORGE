@@ -159,3 +159,24 @@ def test_pending_state_helper_is_used_instead_of_bare_disabled():
     assert not re.search(r"\b(btn|submit|r\.save)\.disabled = (true|false);", js), "use setPending() so aria-busy follows disabled"
     css = (STATIC / "style.css").read_text(encoding="utf-8")
     assert '[aria-busy="true"]' in css and "prefers-reduced-motion" in css
+
+
+# ---- production polish: design tokens, states, first paint, error boundary ---------------------------------------------
+def test_stylesheet_uses_the_type_and_radius_scales():
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    body = css.split("* { box-sizing", 1)[1]  # after the token blocks
+    raw_sizes = [m for m in re.findall(r"font-size:\s*([^;]+);", body) if "px" in m or "rem" in m]
+    assert raw_sizes == [], f"font sizes must use --text-* tokens: {raw_sizes}"
+    raw_radii = [m for m in re.findall(r"border-radius:\s*([^;]+);", body) if "px" in m]
+    assert raw_radii == [], f"radii must use --radius* tokens: {raw_radii}"
+    assert ".btn:active" in css and ".btn:hover" in css and ".btn:disabled" in css and "pointer-events: none" in css
+    assert all(f"--sp-{i}:" in css for i in range(1, 7)) and all(f"--text-{n}:" in css for n in ("xs", "sm", "md", "lg", "xl"))
+
+
+def test_first_paint_and_error_boundary_markup():
+    html = (STATIC / "index.html").read_text(encoding="utf-8")
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert 'data-loaded="false"' in html and 'class="first-load"' in html
+    assert "dataset.loaded = 'true'" in js
+    assert "addEventListener('error'" in js and "addEventListener('unhandledrejection'" in js and "location.reload()" in js
+    assert "API_TIMEOUT_MS = 15000" in js and "taking too long" in js and "noRetry" in js

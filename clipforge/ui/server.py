@@ -51,8 +51,9 @@ from urllib.parse import parse_qs, urlsplit
 import yaml
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field, ValidationError
 from starlette.datastructures import Headers
 from starlette.staticfiles import NotModifiedResponse
@@ -179,6 +180,7 @@ def create_app(settings: Settings, db: DB, *, static_dir: Path | None = None, al
     _register_routes(app)
     app.mount("/static", _RevalidatedStaticFiles(directory=str(st.static_dir), check_dir=False), name="static")
     app.add_middleware(_RequestGuard, allowed_hosts=set(LOOPBACK_HOSTS) | {h.lower() for h in (allowed_hosts or ())})
+    app.add_middleware(GZipMiddleware, minimum_size=1024)  # the 2 s state poll shrinks ~4x
     app.add_middleware(_RequestLog)  # outermost: times the guard too
     return app
 
@@ -228,7 +230,8 @@ class _RequestLog:
             raise
         ms = (time.perf_counter() - started) * 1000
         level = logging.ERROR if status["code"] >= 500 else logging.DEBUG if path.startswith(self.QUIET) else logging.INFO
-        log.log(level, "rid=%s %s %s -> %d in %.0f ms", rid, scope.get("method"), path, status["code"], ms)
+        log.log(level, "rid=%s %s %s -> %d in %.0f ms", rid, scope.get("method"), path, status["code"], ms,
+                extra={"rid": rid, "method": scope.get("method"), "route": path, "status": status["code"], "ms": round(ms, 1)})
 
 
 class _RequestGuard:
@@ -357,6 +360,15 @@ def _platform_or_400(name: str) -> str:
     if platform not in PLATFORMS:
         raise HTTPException(400, f"unknown platform {name!r}; choose from {', '.join(PLATFORMS)}")
     return platform
+
+
+def _pending_run(st: Any, target: str) -> Job | None:
+    """A queued/running non-force run job for the same target: a double click or a retried request must not queue
+    a second pass (the pipeline would skip everything anyway, but the job list would show two)."""
+    for job in st.jobs.list():
+        if job.kind == "run" and job.status in ("queued", "running") and target in job.targets and "(force)" not in job.detail:
+            return job
+    return None
 
 
 def _latest_posts(db: DB) -> dict[tuple[str, str], Any]:
@@ -658,6 +670,22 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one closure per rout
     st = app.state
 
     # ---- pages -----------------------------------------------------------------------------------------------------------
+    @app.exception_handler(404)
+    async def not_found(request: Request, exc: Exception) -> Any:
+        """JSON for the API and media; a small HTML page with a way back for anything a person typed in the address bar."""
+        detail = getattr(exc, "detail", "not found")
+        path = request.url.path
+        wants_json = path.startswith(("/api/", "/media/", "/static/")) or "text/html" not in request.headers.get("accept", "")
+        if wants_json:
+            return JSONResponse({"detail": detail}, status_code=404)
+        body = (
+            "<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Not found</title><style>body{font:16px/1.5 system-ui,sans-serif;margin:0;min-height:100vh;display:grid;place-items:center;"
+            "background:#0f1115;color:#e8ebf0}main{max-width:32rem;padding:2rem}a{color:#7aaefc}@media(prefers-color-scheme:light){body{background:#f3f5f8;color:#161b22}a{color:#2165ec}}</style>"
+            "<main><h1>Page not found</h1><p>ClipForge has one page; everything lives in its tabs.</p><p><a href='/'>Open ClipForge</a></p></main></html>"
+        )
+        return Response(body, status_code=404, media_type="text/html", headers=PAGE_HEADERS)
+
     @app.get("/", include_in_schema=False)
     def index() -> Any:
         page = st.static_dir / "index.html"
@@ -711,11 +739,17 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one closure per rout
     def run_video(video_id: str, body: RunBody | None = None) -> dict[str, str]:
         _video_or_404(st.db, video_id)
         force = bool(body and body.force)
+        existing = _pending_run(st, video_id) if not force else None
+        if existing is not None:
+            return {"job_id": existing.id, "existing": "true"}
         job = st.jobs.submit("run", _run_video_fn(app, video_id, force), f"run {video_id}" + (" (force)" if force else ""), target=video_id)
         return {"job_id": job.id}
 
     @app.post("/api/run")
     def run_queue() -> dict[str, str]:
+        existing = _pending_run(st, QUEUE_TARGET)
+        if existing is not None:
+            return {"job_id": existing.id, "existing": "true"}
         job = st.jobs.submit("run", _run_queue_fn(app), "run queue", target=QUEUE_TARGET)
         return {"job_id": job.id}
 

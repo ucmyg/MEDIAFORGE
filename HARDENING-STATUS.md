@@ -80,6 +80,24 @@ done in-session. Full suite: `pytest` (444+ tests, ~31 s).
   serialisation, so latency scales with concurrency; this is a single-user tool and no throttling exists by design.
   Not proof of production capacity.
 
+## Batch 6 — production polish (UI + resilience) — DONE
+- Findings: 12 ad-hoc font sizes, 5 ad-hoc radii and off-scale spacing values; no `:active`/hover/disabled rules on
+  buttons; no first-paint state; no global error boundary; unknown paths answered JSON to browsers; a double click
+  on Run queued two jobs; state payload uncompressed; text-only logs; on short tabs the mobile nav row absorbed the
+  free viewport height (page grid). Dead controls: none found (43 ids traced; the five tab buttons share one handler).
+- Changes (`ui/static/style.css`, `app.js`, `index.html`, `ui/server.py`, `log.py`): tokens `--sp-1..6` (4/8 scale),
+  `--text-xs..xl` (five sizes), `--radius-xs/sm/-/pill`, `--shadow-1/--shadow`; hover / active / disabled
+  (`pointer-events: none`) states; skeleton until the first `/api/state`; `error` + `unhandledrejection` banner with
+  Reload; 15 s default client timeout with a "taking too long" message and one jittered retry for GETs only;
+  HTML 404 with a way back for browsers (JSON for `/api`, `/media`, `/static`); server-side deduplication of
+  queued/running run jobs (`existing: true`); `GZipMiddleware` (state payload ~4x smaller); `logs/clipforge.jsonl`
+  structured lines with rid/method/route/status/ms; mobile grid rows `auto 1fr`.
+- Verification: real Chromium at 1280 and 375 px on all tabs: loaded flag flips, no overflow, zero console/page
+  errors, 404 page renders with a link home, nav height constant 58 px; static tests enforce the token scales and
+  the error/timeout code paths; API tests for 404 content negotiation, gzip, run dedupe and JSON log fields.
+  Full suite 471 passed.
+- Not done: no error-tracking service (none approved; local single-user tool) and no image pipeline (N/A: no uploads).
+
 ## Remaining (not DONE)
 - P1-e/f: the 768 px layout was checked automatically (overflow, console, keyboard) but not reviewed by a person.
 - P6-19/20: load and restore ran only in this container; the Windows installer (Phase 7) has not been run on Windows.

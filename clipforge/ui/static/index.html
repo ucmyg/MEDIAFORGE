@@ -9,7 +9,7 @@
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="/static/style.css">
 </head>
-<body>
+<body data-loaded="false">
 <div id="offline-banner" class="banner" role="alert" hidden>Server unreachable - retrying every 5 s</div>
 
 <div class="app">
@@ -25,6 +25,10 @@
   </nav>
 
   <main>
+    <div class="first-load" aria-live="polite" aria-busy="true">
+      <p class="muted">Loading ClipForge...</p>
+      <div class="skel"></div><div class="skel tall"></div><div class="skel"></div>
+    </div>
     <!-- ================= Dashboard ================= -->
     <section class="panel" id="tab-dashboard" role="tabpanel" aria-labelledby="tabbtn-dashboard">
       <header class="panel-head">
