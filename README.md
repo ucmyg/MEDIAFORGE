@@ -89,6 +89,7 @@ succeeds), AAC 128 kbps, `+faststart`. No logos, watermarks or promo text are ev
 | `clipforge daemon` | tick every `schedule.tick_s` seconds until Ctrl-C |
 | `clipforge doctor` | environment + credential checks; exit 1 on a hard failure |
 | `clipforge fixture out.mp4 --seconds 120` | synthetic demo video with caption sidecar |
+| `clipforge backup DIR [--with-media]` / `clipforge restore DIR [--force]` | consistent backup of the state (and media); verified restore |
 | `clipforge init-config [--path clipforge.yaml] [--force]` | write a fully commented config |
 | `clipforge ui [--host 127.0.0.1] [--port 8765] [--no-browser]` | local web UI over the same engine |
 | global | `--config PATH`, `--verbose`, `--version` |
@@ -217,6 +218,34 @@ one attempt per window rather than the whole queue. Every action is written to t
 */5 * * * *  cd /path/to/clipforge && .venv/bin/clipforge tick                                       # cron
 schtasks /Create /SC MINUTE /MO 5 /TN ClipForge /TR "C:\path\.venv\Scripts\clipforge.exe tick"      # Windows
 ```
+
+## Backup and restore
+
+Everything ClipForge knows lives in `workspace/` (SQLite state, downloads, clips, transcripts, sign-in tokens) plus
+`clipforge.yaml`. The built-in commands make a consistent copy even while the daemon is running:
+
+```bash
+clipforge backup ~/clipforge-backup-2026-09-17            # SQLite (online backup API) + clipforge.yaml + manifest.json
+clipforge backup ~/clipforge-backup-2026-09-17 --with-media   # also every workspace file except the browser profile
+```
+
+`manifest.json` records row counts and the workspace path. Keep media backups private: they contain the YouTube and
+TikTok token files.
+
+Restore into a fresh location first and check it before touching the real workspace:
+
+```bash
+CLIPFORGE_PATHS__WORKSPACE=/tmp/clipforge-check clipforge restore ~/clipforge-backup-2026-09-17
+CLIPFORGE_PATHS__WORKSPACE=/tmp/clipforge-check clipforge review --no-html      # the app reads the restored data
+clipforge restore ~/clipforge-backup-2026-09-17 --force                         # then into the configured workspace
+```
+
+`restore` copies the database and files, rebases the absolute paths stored in the database to the new workspace,
+runs `PRAGMA integrity_check`, compares row counts with the manifest and reports missing clip files; it refuses to
+overwrite an existing database without `--force`. Stop the daemon and the UI before restoring over a live workspace.
+Measured on a 4-clip demo workspace (3.3 MB): backup 1.1 s, restore 0.3 s. Limits: a restore without `--with-media`
+brings back the state only (clips must be re-rendered with `clipforge run --force`), and the config file is restored
+next to the backup, not copied over your current `clipforge.yaml`.
 
 ## Tests
 

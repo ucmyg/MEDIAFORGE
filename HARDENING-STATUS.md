@@ -61,4 +61,28 @@ done in-session. Full suite: `pytest` (444+ tests, ~31 s).
   computes every text token on every surface in both themes; request-id/log tests.
 - Verification: full suite 462 passed. Screenshots in the session scratchpad (not committed).
 
-## Next batch — 5: backup/restore command + exercised restore, bounded local load smoke
+## Batch 5 — backup/restore, load smoke — DONE
+- Findings: no backup mechanism beyond copying `workspace/`; absolute paths in the DB broke a restore into another
+  location; no load evidence.
+- Changes: `clipforge backup DIR [--with-media]` (SQLite online backup API, config, manifest with row counts; the
+  browser profile is never copied) and `clipforge restore DIR [--force]` (copies, rebases DB paths to the new
+  workspace, `PRAGMA integrity_check`, row counts vs manifest, missing-file report, refuses to overwrite without
+  `--force`) in `clipforge/backup.py` + `cli.py`; README runbook; `tests/test_backup.py`.
+- Restore exercise (real, this environment, demo workspace of 4 clips / 2 posted / 3.3 MB with media):
+  `clipforge backup ... --with-media` 1.1 s; `CLIPFORGE_PATHS__WORKSPACE=<scratch> clipforge restore ...` 0.3 s;
+  integrity ok; rows {videos 1, clips 4, posts 2, log 20} == manifest; 8 paths rebased; 15 files; 0 missing;
+  `clipforge review` on the scratch workspace lists all four clips with their posted/ready status; a second restore
+  without `--force` is refused. Limitation: no production data exists to restore; the exercise used demo data.
+- Load smoke (BOUNDED, SYNTHETIC, loopback uvicorn on a 4-vCPU container, read-only workload 80 % `/api/state`
+  + 20 % ranged clip GET, no external side effects): 5 clients / 10 s = 178 req/s, no errors; 50 clients / 120 s =
+  16 229 requests, 135 req/s, `/api/state` p50 412 ms p95 471 ms max 646 ms, media p50 200 ms p95 305 ms, errors
+  none (no 429/5xx), data intact afterwards (health ready). Saturation: one worker process is CPU-bound on state
+  serialisation, so latency scales with concurrency; this is a single-user tool and no throttling exists by design.
+  Not proof of production capacity.
+
+## Remaining (not DONE)
+- P1-e/f: the 768 px layout was checked automatically (overflow, console, keyboard) but not reviewed by a person.
+- P6-19/20: load and restore ran only in this container; the Windows installer (Phase 7) has not been run on Windows.
+- P4-14: YouTube quota numbers and TikTok PKCE encoding are config-driven but unverified against live docs.
+- Lint/typecheck: none configured in the repo (adding ruff/mypy would be a new dependency; not done).
+- FreeLLM router: not configured; usage metrics unavailable; all work done in-session.

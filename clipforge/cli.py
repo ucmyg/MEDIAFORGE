@@ -588,6 +588,45 @@ def fixture(
     console.print(f"video: {escape(str(video))}\ncaptions: {escape(str(captions))}")
 
 
+@app.command()
+def backup(
+    ctx: typer.Context,
+    dest: Path = typer.Argument(..., help="Folder to write the backup into (created if missing)."),
+    with_media: bool = typer.Option(False, "--with-media", help="Also copy every workspace file (downloads, clips, transcripts, tokens)."),
+) -> None:
+    """Consistent copy of the SQLite state (+ config, + media with --with-media); safe while the daemon runs."""
+    from . import backup as B
+
+    settings = _settings(ctx)
+    try:
+        m = B.create_backup(settings, dest, with_media=with_media)
+    except FileNotFoundError as e:
+        _fail(str(e))
+    console.print(f"backup: {escape(str(dest))}\nrows: {m.counts}\nmedia files: {m.files} ({m.bytes / 1e6:.1f} MB)" + ("\n" + "\n".join(m.notes) if m.notes else ""))
+
+
+@app.command()
+def restore(
+    ctx: typer.Context,
+    src: Path = typer.Argument(..., help="A folder written by `clipforge backup`."),
+    force: bool = typer.Option(False, "--force", help="Overwrite an existing database in the target workspace."),
+) -> None:
+    """Restore a backup into the configured workspace (use --config / CLIPFORGE_PATHS__WORKSPACE to pick a scratch one)."""
+    from . import backup as B
+
+    settings = _settings(ctx)
+    try:
+        r = B.restore_backup(src, settings, force=force)
+    except (FileNotFoundError, FileExistsError) as e:
+        _fail(str(e))
+    console.print(
+        f"restored into {escape(r.workspace)} in {r.seconds:.1f} s\nintegrity: {r.integrity}\nrows: {r.counts} (expected {r.expected})\n"
+        f"paths rebased: {r.rebased_paths}; files restored: {r.files_restored}; clip files missing: {r.missing_clip_files}"
+    )
+    if not r.ok:
+        _fail("restore verification failed (integrity or row counts differ from the manifest)")
+
+
 @app.command("init-config")
 def init_config(
     ctx: typer.Context,
