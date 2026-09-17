@@ -29,6 +29,8 @@ CONTRACT_PATHS = [
     r"/api/auth/(?:\{x\}|youtube|tiktok)/start",
     r"/api/auth/tiktok/complete",
     r"/api/scheduler",
+    r"/api/schedule",
+    r"/api/schedule/\{x\}",
     r"/api/tick",
     r"/api/doctor",
     r"/api/logs",
@@ -104,7 +106,7 @@ def test_app_js_uses_only_contract_paths():
     used = {INTERPOLATION_RE.sub("{x}", raw).split("?", 1)[0] for raw in found}
     for needed in ("/api/state", "/api/videos", "/api/run", "/api/publish", "/api/scheduler", "/api/tick", "/api/doctor", "/api/logs", "/api/settings",
                    "/api/videos/{x}/run", "/api/clips/{x}/status", "/api/clips/{x}/meta", "/api/clips/{x}/caption", "/api/clips/{x}/posted",
-                   "/api/auth/tiktok/complete"):
+                   "/api/auth/tiktok/complete", "/api/schedule", "/api/schedule/{x}"):
         assert needed in used, f"contract endpoint not used by the UI: {needed}"
 
 

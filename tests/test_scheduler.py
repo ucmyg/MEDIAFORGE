@@ -675,3 +675,163 @@ def test_capacity_is_reserved_inside_the_claim(sched: Sched):
         c.execute("UPDATE posts SET claimed_at=? WHERE clip_id='vid_00'", (S._iso_utc(at("06:35")),))
     res = sched.tick("09:05")
     assert res.posted == [] and any("allowance reserved" in r for r in res.skipped), res.skipped
+
+
+# ---- scheduled entries: "post this clip on this platform at this time" ----------------------------------------------
+def test_parse_when_local_iso_and_past():
+    now = at("08:00")
+    assert S.parse_when("2026-09-20 18:00", now) == datetime(2026, 9, 20, 18, 0, tzinfo=TZ)
+    assert S.parse_when("2026-09-20T18:00", now) == datetime(2026, 9, 20, 18, 0, tzinfo=TZ)
+    assert S.parse_when("2026-09-20T16:00:00+00:00", now) == datetime(2026, 9, 20, 18, 0, tzinfo=TZ)
+    assert S.parse_when("2026-09-20T16:00:00Z", now) == datetime(2026, 9, 20, 18, 0, tzinfo=TZ)
+    with pytest.raises(ValueError, match="in the past"):
+        S.parse_when("2026-09-15 07:00", now)
+    with pytest.raises(ValueError, match="cannot read"):
+        S.parse_when("tomorrow", now)
+    with pytest.raises(ValueError, match="required"):
+        S.parse_when("  ", now)
+
+
+def test_schedule_post_validates(sched: Sched):
+    sched.add_ready("a", "b")
+    make_ready(sched.db, sched.settings.workspace_dir, "raw", idx=5, status="rendered")
+    when = at("18:00", DAY + timedelta(days=1))
+    now = sched.clock.now
+    with pytest.raises(ValueError, match="unknown platform"):
+        S.schedule_post(sched.settings, sched.db, "a", "myspace", when, now=now)
+    with pytest.raises(ValueError, match="unknown clip"):
+        S.schedule_post(sched.settings, sched.db, "nope", "youtube", when, now=now)
+    with pytest.raises(ValueError, match="approve it in Review first"):
+        S.schedule_post(sched.settings, sched.db, "raw", "youtube", when, now=now)
+    with pytest.raises(ValueError, match="in the past"):
+        S.schedule_post(sched.settings, sched.db, "a", "youtube", at("07:00"), now=now)
+    entry = S.schedule_post(sched.settings, sched.db, "a", "youtube", when, now=now)
+    assert entry.status == "pending" and entry.run_at == when.astimezone(timezone.utc).isoformat(timespec="seconds")
+    with pytest.raises(ValueError, match="already scheduled"):
+        S.schedule_post(sched.settings, sched.db, "a", "youtube", when + timedelta(hours=1), now=now)
+    S.schedule_post(sched.settings, sched.db, "a", "tiktok", when, now=now)  # another platform is fine
+    sched.db.mark_posted("b", "youtube", "yt-x")
+    with pytest.raises(ValueError, match="already posted"):
+        S.schedule_post(sched.settings, sched.db, "b", "youtube", when, now=now)
+    assert [e.clip_id for e in sched.db.list_scheduled(status="pending")] == ["a", "a"]
+    assert sched.db.reserved_clips("youtube") == {"a"}
+
+
+def test_schedule_post_respects_the_per_day_cap_for_that_day(sched: Sched):
+    sched.settings.platforms.youtube.per_day = 2
+    sched.add_ready("a", "b", "c", "d")
+    now = sched.clock.now
+    day = DAY + timedelta(days=2)
+    S.schedule_post(sched.settings, sched.db, "a", "youtube", at("09:00", day), now=now)
+    S.schedule_post(sched.settings, sched.db, "b", "youtube", at("18:00", day), now=now)
+    with pytest.raises(ValueError, match="limit 2 per day"):
+        S.schedule_post(sched.settings, sched.db, "c", "youtube", at("21:00", day), now=now)
+    S.schedule_post(sched.settings, sched.db, "c", "youtube", at("09:00", day + timedelta(days=1)), now=now)  # next day is free
+    # posts already made today count too
+    sched.db.mark_posted("d", "youtube", "yt-d")
+    S.schedule_post(sched.settings, sched.db, "c", "tiktok", at("23:00"), now=now)  # other platform: unaffected
+    with pytest.raises(ValueError, match="already has"):
+        sched.settings.platforms.youtube.per_day = 1
+        S.schedule_post(sched.settings, sched.db, "a", "youtube", at("23:00"), now=now)
+
+
+def test_scheduled_entry_posts_at_its_time_not_before(sched: Sched):
+    sched.add_ready("a")
+    S.schedule_post(sched.settings, sched.db, "a", "youtube", at("10:30"), now=sched.clock.now)
+    r = sched.tick("09:00")  # the 09:00 slot is due, but `a` is reserved for 10:30
+    assert r.posted == [] and sched.publishers["youtube"].calls == []
+    assert any("no ready clip" in s for s in r.skipped)
+    r = sched.tick("10:29")
+    assert r.posted == []
+    r = sched.tick("10:31")
+    assert r.posted == [("a", "youtube", "youtube-1")]
+    (entry,) = sched.db.list_scheduled()
+    assert entry.status == "posted" and entry.post_id == "youtube-1"
+    assert sched.db.is_posted("a", "youtube")
+    assert any(row["action"] == "schedule.posted" for row in sched.db.recent_log())
+    r = sched.tick("13:00")  # nothing left; the entry is not re-run
+    assert r.posted == [] and sched.publishers["youtube"].calls == ["a"]
+
+
+def test_scheduled_entry_ignores_min_gap_but_slot_after_it_respects_it(sched: Sched):
+    sched.add_ready("a", "b")
+    sched.tick("09:00")  # slot posts `a` at 09:00
+    assert sched.publishers["youtube"].calls == ["a"]
+    S.schedule_post(sched.settings, sched.db, "b", "youtube", at("09:30"), now=sched.clock.now)
+    r = sched.tick("09:30")  # 30 min after the last post, inside the 2 h min gap: explicit time wins
+    assert r.posted == [("b", "youtube", "youtube-2")]
+
+
+def test_scheduled_entry_is_skipped_when_not_configured_and_dry_run_only_reports(sched: Sched):
+    sched.settings.schedule.times = []  # no slots: only the explicit entry can post
+    sched.add_ready("a")
+    S.schedule_post(sched.settings, sched.db, "a", "tiktok", at("10:00"), now=sched.clock.now)
+    r = sched.tick("10:05")
+    assert r.posted == [] and any("tiktok is not configured" in s for s in r.skipped)
+    assert sched.db.get_scheduled(1).status == "pending"
+    sched.publishers["tiktok"] = FakePublisher("tiktok", sched.settings, sched.db)
+    r = sched.tick("10:06", dry_run=True)
+    assert r.posted == [("a", "tiktok", S.DRY_RUN_POST_ID)] and sched.db.get_scheduled(1).status == "pending"
+    r = sched.tick("10:07")
+    assert r.posted == [("a", "tiktok", "tiktok-1")] and sched.db.get_scheduled(1).status == "posted"
+
+
+def test_scheduled_entry_missed_for_too_long_is_marked_failed(sched: Sched):
+    sched.add_ready("a")
+    S.schedule_post(sched.settings, sched.db, "a", "youtube", at("10:00"), now=sched.clock.now)
+    r = sched.tick("23:00")  # 13 h late: the daemon was off
+    entry = sched.db.get_scheduled(1)
+    assert entry.status == "failed" and "missed" in (entry.error or "")
+    # the clip is an approved clip again, so the slot scheduler takes it (the 18:00 slot is due) - not the entry
+    assert r.posted == [("a", "youtube", "youtube-1")] and any("missed" in e for e in r.errors)
+    assert sched.db.get_scheduled(1).status == "failed"
+
+
+def test_scheduled_entry_retries_then_gives_up_like_the_slot_path(sched: Sched):
+    sched.add_ready("a")
+    pub = sched.publishers["youtube"]
+    pub.failures = [PublishError("boom"), PublishError("boom again")]
+    S.schedule_post(sched.settings, sched.db, "a", "youtube", at("10:00"), now=sched.clock.now)
+    r = sched.tick("10:00")
+    assert r.posted == [] and r.errors and sched.db.get_scheduled(1).status == "pending"
+    r = sched.tick("10:01")  # backoff not over: skipped, still pending
+    assert any("retries after" in s for s in r.skipped)
+    r = sched.tick("10:06")  # 300 s backoff over: second attempt fails too
+    assert r.errors and sched.db.get_scheduled(1).status == "pending"
+    r = sched.tick("10:20")  # third attempt succeeds
+    assert r.posted == [("a", "youtube", "youtube-3")] and sched.db.get_scheduled(1).status == "posted"
+
+
+def test_scheduled_entry_final_failure_and_rejection(sched: Sched):
+    sched.add_ready("a", "b")
+    pub = sched.publishers["youtube"]
+    pub.failures = [PublishFatal("bad file")]
+    S.schedule_post(sched.settings, sched.db, "a", "youtube", at("10:00"), now=sched.clock.now)
+    S.schedule_post(sched.settings, sched.db, "b", "youtube", at("10:00"), now=sched.clock.now)
+    sched.db.set_clip_status("b", "rejected")
+    r = sched.tick("10:00")
+    a, b = sched.db.list_scheduled()
+    assert a.status == "failed" and "gave up" in a.error
+    assert b.status == "failed" and "rejected" in b.error
+    assert pub.calls == ["a"] and len(r.errors) == 2
+
+
+def test_cancel_scheduled_entry(sched: Sched):
+    sched.add_ready("a")
+    entry = S.schedule_post(sched.settings, sched.db, "a", "youtube", at("10:00"), now=sched.clock.now)
+    assert S.cancel_scheduled(sched.db, entry.id).status == "cancelled"
+    with pytest.raises(ValueError, match="not pending"):
+        S.cancel_scheduled(sched.db, entry.id)
+    with pytest.raises(ValueError, match="no scheduled post"):
+        S.cancel_scheduled(sched.db, 999)
+    r = sched.tick("10:00")  # cancelled entries never post; the clip is back in the slot pool (slot 09:00 due)
+    assert r.posted == [("a", "youtube", "youtube-1")]
+    assert sched.db.get_scheduled(entry.id).status == "cancelled"
+
+
+def test_scheduled_entry_closed_when_already_posted_by_hand(sched: Sched):
+    sched.add_ready("a")
+    entry = S.schedule_post(sched.settings, sched.db, "a", "youtube", at("10:00"), now=sched.clock.now)
+    sched.db.mark_posted("a", "youtube", "yt-manual")
+    r = sched.tick("10:00")
+    assert r.posted == [] and sched.db.get_scheduled(entry.id).status == "posted" and sched.db.get_scheduled(entry.id).post_id == "yt-manual"

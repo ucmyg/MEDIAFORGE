@@ -7,7 +7,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from ..db import Clip, Post, Video
+from ..db import Clip, Post, Scheduled, Video
 from ..metadata import ClipMeta, read_meta
 from ..publish import PLATFORMS
 from ..publish.base import Limits
@@ -135,6 +135,23 @@ def clip_dict(clip: Clip, posts: dict[str, Post | None], meta: ClipMeta | None) 
         "media_url": media_url(clip),
         "meta": meta_dict(meta),
         "posts": {p: post_dict(posts.get(p)) for p in PLATFORMS},
+    }
+
+
+def scheduled_dict(entry: Scheduled, clip: Clip | None) -> dict[str, Any]:
+    return {
+        "id": entry.id,
+        "clip_id": entry.clip_id,
+        "platform": entry.platform,
+        "run_at": entry.run_at,
+        "status": entry.status,
+        "post_id": entry.post_id,
+        "url": post_url(entry.platform, entry.post_id) if entry.post_id else None,
+        "error": entry.error,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+        "hook": clip.hook if clip else None,
+        "clip_status": clip.status if clip else None,
     }
 
 

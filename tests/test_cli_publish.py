@@ -245,3 +245,59 @@ def test_doctor_token_rows_are_file_checks(settings: Settings):
     rows = {c.name: c for c in C._check_credentials(settings)}
     assert rows["youtube token"].status == "OK" and rows["tiktok token"].status == "OK"
     assert rows["youtube client_secret"].status == "WARN" and rows["tiktok client_key"].status == "WARN"
+
+
+# ---- schedule add / list / cancel ----------------------------------------------------------------------------------------
+def test_schedule_add_list_cancel(cli: Cli):
+    from datetime import datetime, timedelta
+
+    cli.ready("a", "b")
+    when = (datetime.now() + timedelta(days=1)).replace(second=0, microsecond=0)
+    at = when.strftime("%Y-%m-%d %H:%M")
+    r = cli("schedule", "add", "a", "--at", at, "--to", "youtube,tiktok")
+    assert r.exit_code == 0, r.output
+    assert "scheduled #1: a -> youtube" in r.output and "scheduled #2: a -> tiktok" in r.output
+    entries = cli.db.list_scheduled()
+    assert [(e.clip_id, e.platform, e.status) for e in entries] == [("a", "youtube", "pending"), ("a", "tiktok", "pending")]
+    r = cli("schedule", "list")
+    assert r.exit_code == 0 and "a" in r.output and "youtube" in r.output and "pending" in r.output and at in r.output
+    # refusals: duplicate, past, unknown clip, bad time
+    r = cli("schedule", "add", "a", "--at", at, "--to", "youtube")
+    assert r.exit_code == EXIT_FAILED and "already scheduled" in r.output
+    r = cli("schedule", "add", "b", "--at", "2020-01-01 09:00")
+    assert r.exit_code == EXIT_USAGE and "in the past" in r.output
+    r = cli("schedule", "add", "zzz", "--at", at)
+    assert r.exit_code == EXIT_FAILED and "unknown clip" in r.output
+    r = cli("schedule", "add", "b", "--at", "next tuesday")
+    assert r.exit_code == EXIT_USAGE and "cannot read the time" in r.output
+    # cancel
+    r = cli("schedule", "cancel", "1")
+    assert r.exit_code == 0 and "cancelled #1: a -> youtube" in r.output
+    assert cli("schedule", "cancel", "1").exit_code == EXIT_USAGE
+    assert cli("schedule", "cancel", "77").exit_code == EXIT_USAGE
+    r = cli("schedule", "list")
+    assert "tiktok" in r.output and "youtube" not in r.output.split("scheduled posts", 1)[-1].replace("platform", "")
+    r = cli("schedule", "list", "--all")
+    assert "cancelled" in r.output
+    assert cli("schedule", "list").exit_code == 0
+
+
+def test_tick_posts_a_scheduled_entry_when_due(cli: Cli, monkeypatch):
+    from datetime import datetime, timedelta
+
+    cli.ready("a", "b")
+    cli.factory(  # tick builds publishers through the factory; pre-warm nothing, just make sure youtube is configured
+        "youtube", cli.factory.settings, cli.db)
+    soon = (datetime.now().astimezone() + timedelta(seconds=30)).strftime("%Y-%m-%dT%H:%M:%S%z")
+    assert cli("schedule", "add", "b", "--at", soon, "--to", "youtube").exit_code == 0
+    # the slot at 00:00 is due and posts the oldest free clip (`a`); `b` is reserved for its own minute
+    r = cli("tick")
+    assert r.exit_code == 0, r.output
+    assert cli.db.is_posted("a", "youtube") and not cli.db.is_posted("b", "youtube")
+    # push the entry into the past and tick again: it posts (inside the 2 h min gap, which explicit times ignore)
+    with cli.db.connect() as c:
+        c.execute("UPDATE scheduled SET run_at=? WHERE clip_id='b'", ((datetime.now().astimezone() - timedelta(minutes=1)).isoformat(timespec="seconds"),))
+    r = cli("tick")
+    assert r.exit_code == 0, r.output
+    assert cli.db.is_posted("b", "youtube") and cli.db.list_scheduled()[0].status == "posted"
+    assert "posted" in cli("schedule", "list", "--all").output

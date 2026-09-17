@@ -1,7 +1,8 @@
 """Scheduler (Phase 3): one-shot `tick` (cron / Task Scheduler) and the `daemon` loop around it.
 
-A tick (1) processes queued videos through the pipeline and (2) posts at most ONE ready clip per platform when a
-schedule slot is due. A slot (schedule.times, local wall-clock) is due once it has opened today and nothing was posted
+A tick (1) processes queued videos through the pipeline, (2) posts every *scheduled* entry that is due (a per-clip
+"post this clip on this platform at this time", see schedule_post) and (3) posts at most ONE ready clip per platform
+when a schedule slot is due. A slot (schedule.times, local wall-clock) is due once it has opened today and nothing was posted
 on that platform since it opened; missed slots collapse into one post (the daemon never "catches up" a backlog).
 Posting is further gated by schedule.min_gap_h since the platform's last post, by Publisher.limits() (per_day and
 the YouTube quota budget) and by a non-interactive Publisher.credentials_ok() probe (unusable credentials are a
@@ -28,7 +29,7 @@ from typing import Callable, Sequence
 
 from . import pipeline
 from .config import Settings
-from .db import CLAIM_STALE_S, DB, Clip
+from .db import CLAIM_STALE_S, DB, Clip, Scheduled
 from .log import console, get_logger
 from .metadata import ClipMeta, read_meta
 from .publish import PLATFORMS, get_publisher
@@ -42,6 +43,10 @@ LOG_ACTIONS = {"schedule": ("schedule.posted", "schedule.failed"), "publish": ("
 COOLDOWN_KEY = "sched.{platform}.cooldown_until"  # kv: platform-level backoff after any failure (UTC ISO)
 CLAIM_STALE = timedelta(seconds=CLAIM_STALE_S)  # an `uploading` claim older than this belongs to a dead process and may be taken over
 PUBLISHABLE = ("rendered", "ready", "posted")  # never rejected/failed/candidate: re-checked under the claim
+SCHEDULABLE = ("ready", "posted")  # a scheduled entry needs an approved clip (posted = approved and out on another platform)
+SCHEDULED_GRACE_H = 12.0  # a scheduled entry this late (the scheduler was not running) is marked missed instead of posted
+SCHEDULE_PAST_SLACK_S = 60  # "now" typed a moment ago still counts as the future
+WHEN_FORMATS = ("%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S")  # local wall-clock inputs
 
 
 class InProgress(RuntimeError):
@@ -148,6 +153,7 @@ def tick(
     injected = publishers or {}
     names = platforms or list(injected) or list(PLATFORMS)
     active = _active_publishers(settings, db, names, injected, check_configured=platforms is None, result=result)
+    _run_scheduled(settings, db, active, now, result)
     for publisher in active.values():
         try:
             _tick_platform(settings, db, publisher, times, now, list(active), result)
@@ -274,11 +280,12 @@ def _pick_clip(db: DB, platform: str, now: datetime) -> tuple[Clip | None, list[
 
     `posted` clips are included because a clip flips to `posted` once every *active* platform has it (e.g.
     `publish --now --to youtube`, or while tiktok was unconfigured); the is_posted check keeps out the real ones.
-    Also returns notes about clips that were passed over because they wait for a backoff or failed permanently.
+    Clips with a pending scheduled entry on `platform` are reserved for their own time. Also returns notes about clips that were passed over because they wait for a backoff or failed permanently.
     """
     notes: list[str] = []
+    reserved = db.reserved_clips(platform)  # a pending scheduled entry owns its clip until its time
     for clip in sorted(db.list_clips(status=["ready", "posted"]), key=lambda c: c.created_at):
-        if db.is_posted(clip.id, platform):
+        if db.is_posted(clip.id, platform) or clip.id in reserved:
             continue
         post = db.get_post(clip.id, platform)
         if post is None:
@@ -296,8 +303,163 @@ def _pick_clip(db: DB, platform: str, now: datetime) -> tuple[Clip | None, list[
     return None, notes
 
 
+# ---- scheduled entries: "post this clip on this platform at this time" ----------------------------------------------
+def parse_when(text: str, now: datetime | None = None) -> datetime:
+    """'YYYY-MM-DD HH:MM' (local wall-clock, 'T' accepted) or any ISO 8601 with an offset -> aware datetime.
+    ValueError names the problem; the past (beyond a minute of slack) is refused."""
+    now = _aware(now)
+    raw = str(text).strip()
+    if not raw:
+        raise ValueError("a date and time is required, e.g. '2026-09-20 18:00'")
+    when: datetime | None = None
+    for fmt in WHEN_FORMATS:
+        try:
+            when = datetime.strptime(raw, fmt)
+            break
+        except ValueError:
+            continue
+    if when is None:
+        try:
+            when = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            raise ValueError(f"cannot read the time {raw!r}; use 'YYYY-MM-DD HH:MM' (local time)") from None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=now.tzinfo)
+    if when < now - timedelta(seconds=SCHEDULE_PAST_SLACK_S):
+        raise ValueError(f"{when.strftime('%Y-%m-%d %H:%M')} is in the past; pick a later time")
+    return when
+
+
+def schedule_post(settings: Settings, db: DB, clip_id: str, platform: str, when: datetime, *, now: datetime | None = None) -> Scheduled:
+    """Queue clip_id for platform at `when`. ValueError explains a refusal: unknown platform/clip, clip not approved,
+    already posted there, already scheduled there, the platform's per-day cap for that day is spoken for."""
+    now = _aware(now)
+    when = _aware(when)
+    if platform not in PLATFORMS:
+        raise ValueError(f"unknown platform {platform!r}; choose from {', '.join(PLATFORMS)}")
+    clip = db.get_clip(clip_id)
+    if clip is None:
+        raise ValueError(f"unknown clip {clip_id!r}")
+    if clip.status not in SCHEDULABLE:
+        hint = "approve it in Review first" if clip.status == "rendered" else f"it is {clip.status}"
+        raise ValueError(f"clip {clip_id} cannot be scheduled: {hint}")
+    if db.is_posted(clip_id, platform):
+        raise ValueError(f"clip {clip_id} is already posted on {platform}")
+    if when < now - timedelta(seconds=SCHEDULE_PAST_SLACK_S):
+        raise ValueError(f"{when.strftime('%Y-%m-%d %H:%M')} is in the past; pick a later time")
+    per_day = _per_day(settings, platform)
+    if per_day >= 0:
+        local = when.astimezone(now.tzinfo)
+        day_start = local.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_iso, end_iso = _iso_utc(day_start), _iso_utc(day_start + timedelta(days=1))
+        taken = db.count_scheduled_between(platform, start_iso, end_iso)
+        taken += sum(1 for p in db.posts_since(platform, start_iso) if p.posted_at and p.posted_at < end_iso)
+        if taken >= per_day:
+            raise ValueError(f"{platform} already has {taken} post(s) on {local.strftime('%Y-%m-%d')} (limit {per_day} per day); pick another day or raise platforms.{platform}.per_day")
+    entry = db.add_scheduled(clip_id, platform, _iso_utc(when))
+    db.log("schedule.add", f"{clip_id} -> {platform} at {when.astimezone(now.tzinfo).strftime('%Y-%m-%d %H:%M')} (#{entry.id})")
+    log.info("%s: scheduled %s for %s", platform, clip_id, when.astimezone(now.tzinfo).strftime("%Y-%m-%d %H:%M"))
+    return entry
+
+
+def cancel_scheduled(db: DB, entry_id: int) -> Scheduled:
+    """Cancel a pending entry; ValueError when it is unknown or no longer pending."""
+    entry = db.get_scheduled(entry_id)
+    if entry is None:
+        raise ValueError(f"no scheduled post #{entry_id}")
+    if not db.cancel_scheduled(entry_id):
+        raise ValueError(f"scheduled post #{entry_id} is {entry.status}, not pending; nothing to cancel")
+    db.log("schedule.cancel", f"#{entry_id}: {entry.clip_id} -> {entry.platform} at {_parse_ts(entry.run_at, None).strftime('%Y-%m-%d %H:%M')} cancelled")
+    refreshed = db.get_scheduled(entry_id)
+    return refreshed if refreshed is not None else entry
+
+
+def _run_scheduled(settings: Settings, db: DB, active: dict[str, Publisher], now: datetime, result: TickResult) -> None:
+    """Post every due scheduled entry (earliest first). Retryable failures leave the entry pending (the posts row's
+    backoff gates the next try); final ones, a rejected clip and an entry older than SCHEDULED_GRACE_H mark it failed."""
+    for entry in db.due_scheduled(_iso_utc(now)):
+        name = entry.platform
+        label = f"scheduled #{entry.id} {entry.clip_id} -> {name}"
+        try:
+            _run_one_scheduled(settings, db, active, now, result, entry, label)
+        except Exception as err:  # one entry's crash must not stop the others
+            result.errors.append(f"{label}: {type(err).__name__}: {err}")
+            log.error("%s: %s: %s", label, type(err).__name__, err)
+
+
+def _run_one_scheduled(settings: Settings, db: DB, active: dict[str, Publisher], now: datetime, result: TickResult, entry: Scheduled, label: str) -> None:
+    name = entry.platform
+    run_at = _parse_ts(entry.run_at, now.tzinfo)
+    clip = db.get_clip(entry.clip_id)
+    if clip is None or clip.status not in PUBLISHABLE:
+        _scheduled_failed(db, entry, f"clip is {'gone' if clip is None else clip.status}", result, label)
+        return
+    if db.is_posted(clip.id, name):  # posted by hand / `publish --now` in the meantime
+        post = db.get_post(clip.id, name)
+        db.set_scheduled(entry.id, "posted", post_id=post.post_id if post else None)
+        result.skipped.append(f"{label}: already posted, entry closed")
+        return
+    if now - run_at > timedelta(hours=SCHEDULED_GRACE_H):
+        _scheduled_failed(db, entry, f"missed: due {run_at.strftime('%Y-%m-%d %H:%M')}, the scheduler was not running (more than {SCHEDULED_GRACE_H:g} h ago)", result, label)
+        return
+    publisher = active.get(name)
+    if publisher is None:
+        result.skipped.append(f"{label}: due but {name} is not configured (run `clipforge auth {name}`); still pending")
+        return
+    post = db.get_post(clip.id, name)
+    if post is not None:
+        if claim_is_live(post, now):
+            result.skipped.append(f"{label}: being posted by another process")
+            return
+        if post.status == "failed":
+            _scheduled_failed(db, entry, f"gave up after {post.attempts} attempt(s): {post.error or 'unknown error'}", result, label)
+            return
+        if post.attempts > 0 and post.next_attempt_at and _parse_ts(post.next_attempt_at, now.tzinfo) > now:
+            result.skipped.append(f"{label}: retries after {_hm(_parse_ts(post.next_attempt_at, now.tzinfo))}")
+            return
+    limits = publisher.limits()
+    if limits.exhausted:
+        _scheduled_failed(db, entry, f"daily allowance exhausted at the scheduled time ({limits.posted_today}/{limits.per_day} posted today)", result, label)
+        return
+    cooldown = cooldown_until(db, name, now.tzinfo)
+    if cooldown is not None and cooldown > now:
+        result.skipped.append(f"{label}: due but {name} is backing off until {_hm(cooldown)} after a failure")
+        return
+    if not publisher.credentials_ok():
+        result.skipped.append(f"{label}: due but no usable credentials; run `clipforge auth {name}`")
+        log.error("%s: no usable credentials; run `clipforge auth %s`", name, name)
+        return
+    if result.dry_run:
+        result.posted.append((clip.id, name, DRY_RUN_POST_ID))
+        log.info("dry run: would post %s to %s (scheduled for %s)", clip.id, name, _hm(run_at))
+        return
+    try:
+        post_id = publish_clip(settings, db, publisher, clip, list(active), now=now, min_gap=False)
+    except InProgress as err:
+        result.skipped.append(f"{label}: {err}")
+        return
+    except Exception as err:
+        result.errors.append(f"{label}: " + _failure_message(settings, db, clip, name, err, now))
+        post = db.get_post(clip.id, name)
+        if post is not None and post.status == "failed":
+            db.set_scheduled(entry.id, "failed", error=f"gave up after {post.attempts} attempt(s): {err}")
+        return
+    db.set_scheduled(entry.id, "posted", post_id=post_id)
+    db.log("schedule.posted", f"{label} {post_id} (scheduled for {run_at.strftime('%Y-%m-%d %H:%M')})")
+    result.posted.append((clip.id, name, post_id))
+
+
+def _scheduled_failed(db: DB, entry: Scheduled, reason: str, result: TickResult, label: str) -> None:
+    db.set_scheduled(entry.id, "failed", error=reason)
+    db.log("schedule.failed", f"{label}: {reason}", level="error")
+    log.error("%s: %s", label, reason)
+    result.errors.append(f"{label}: {reason}")
+
+
 # ---- posting (shared with `clipforge publish --now`) ----------------------------------------------------------------
-def publish_clip(settings: Settings, db: DB, publisher: Publisher, clip: Clip, active: Sequence[str], *, now: datetime | None = None, source: str = "schedule") -> str:
+def publish_clip(
+    settings: Settings, db: DB, publisher: Publisher, clip: Clip, active: Sequence[str], *, now: datetime | None = None, source: str = "schedule", min_gap: bool | None = None
+) -> str:
     """Post one clip through `publisher`, recording the attempt either way; returns the post id or re-raises.
 
     An exhausted allowance raises PublishFatal before anything is recorded (nothing was attempted); a claim held by
@@ -305,9 +467,13 @@ def publish_clip(settings: Settings, db: DB, publisher: Publisher, clip: Clip, a
     here otherwise) and flips the clip to `posted` once every platform in `active` has it. Failures get
     attempts/backoff/final recorded (see _record_failure) and are re-raised. A NotConfirmed decline and an interrupt
     (Ctrl-C, SIGTERM) record nothing: the claim is released (a row this call created is dropped again).
+    `min_gap` enforces schedule.min_gap_h (default: only for the slot scheduler; an explicit time or `publish --now`
+    is the user's own choice).
     """
     now = _aware(now)
     name = publisher.name
+    if min_gap is None:
+        min_gap = source == "schedule"
     publisher.ensure_allowance()
     row = db.ensure_post(clip.id, name)
     attempts_before = row.attempts
@@ -318,7 +484,7 @@ def publish_clip(settings: Settings, db: DB, publisher: Publisher, clip: Clip, a
         _iso_utc(now - CLAIM_STALE),
         day_start_iso=_day_start_iso(publisher, now),
         per_day=_per_day(settings, name, publisher),
-        gap_before_iso=_iso_utc(now - timedelta(hours=settings.schedule.min_gap_h)) if source == "schedule" else None,
+        gap_before_iso=_iso_utc(now - timedelta(hours=settings.schedule.min_gap_h)) if min_gap else None,
     )
     if verdict == "busy":
         raise InProgress(f"{name}: clip {clip.id} is being posted by another clipforge process")

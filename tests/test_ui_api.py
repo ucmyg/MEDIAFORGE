@@ -11,7 +11,7 @@ import logging
 import logging.handlers
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -226,7 +226,8 @@ def test_request_guard_blocks_rebinding_and_cross_site_posts(api: TestClient, se
 def test_state_shape(api: TestClient, settings: Settings, db: DB):
     stub_clip(db, settings.workspace_dir, "vid_00")
     state = api.get("/api/state").json()
-    assert set(state) == {"videos", "clips", "jobs", "scheduler", "settings", "totals", "truncated"}
+    assert set(state) == {"videos", "clips", "jobs", "scheduler", "scheduled", "settings", "totals", "truncated"}
+    assert state["scheduled"] == []
     assert state["totals"] == {"videos": 1, "clips": 1} and state["truncated"] == {"videos": False, "clips": False}
     (video,) = state["videos"]
     assert video["id"] == VID and video["status"] == "done" and video["clip_count"] == 1 and video["options"] == {}
@@ -1062,3 +1063,43 @@ def test_json_log_lines_carry_request_fields(api: TestClient, settings: Settings
     access = [l for l in lines if l.get("route") == "/api/doctor"]
     assert access and {"ts", "level", "logger", "msg", "rid", "method", "route", "status", "ms"} <= set(access[-1])
     assert access[-1]["status"] == 200 and isinstance(access[-1]["ms"], (int, float))
+
+
+# ---- per-clip scheduled posts -----------------------------------------------------------------------------------------
+def test_schedule_add_list_cancel(api: TestClient, settings: Settings, db: DB):
+    stub_clip(db, settings.workspace_dir, "vid_00")
+    stub_clip(db, settings.workspace_dir, "vid_01", idx=1, status="rendered")
+    at = (datetime.now().astimezone() + timedelta(days=1)).replace(microsecond=0).strftime("%Y-%m-%dT%H:%M")
+    r = api.post("/api/schedule", json={"clip_id": "vid_00", "platforms": ["youtube", "tiktok"], "at": at})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [e["platform"] for e in body["scheduled"]] == ["youtube", "tiktok"] and body["errors"] == []
+    assert all(e["status"] == "pending" and e["clip_id"] == "vid_00" and e["hook"] == "hook vid_00" for e in body["scheduled"])
+    state = api.get("/api/state").json()
+    assert [(e["platform"], e["status"]) for e in state["scheduled"]] == [("youtube", "pending"), ("tiktok", "pending")]
+    # a second youtube entry for the same clip is refused per platform; nothing else -> 409
+    r = api.post("/api/schedule", json={"clip_id": "vid_00", "platforms": ["youtube"], "at": at})
+    assert r.status_code == 409 and "already scheduled" in r.json()["detail"]
+    # a rendered (unapproved) clip, an unknown clip, a past time, a bad platform
+    assert api.post("/api/schedule", json={"clip_id": "vid_01", "platforms": ["youtube"], "at": at}).status_code == 409
+    assert api.post("/api/schedule", json={"clip_id": "nope", "platforms": ["youtube"], "at": at}).status_code == 404
+    assert api.post("/api/schedule", json={"clip_id": "vid_00", "platforms": ["youtube"], "at": "2020-01-01T10:00"}).status_code == 400
+    assert api.post("/api/schedule", json={"clip_id": "vid_00", "platforms": ["myspace"], "at": at}).status_code == 400
+    assert api.post("/api/schedule", json={"clip_id": "vid_00", "platforms": [], "at": at}).status_code == 400
+    # cancel one; the other stays; cancelling twice is a 409, unknown is a 404
+    yt = body["scheduled"][0]["id"]
+    r = api.delete(f"/api/schedule/{yt}")
+    assert r.status_code == 200 and r.json()["status"] == "cancelled"
+    assert api.delete(f"/api/schedule/{yt}").status_code == 409
+    assert api.delete("/api/schedule/999").status_code == 404
+    state = api.get("/api/state").json()
+    assert [(e["platform"], e["status"]) for e in state["scheduled"]] == [("tiktok", "pending"), ("youtube", "cancelled")]
+    assert any(row["action"] == "schedule.cancel" for row in db.recent_log())
+
+
+def test_schedule_delete_needs_the_ui_header(api: TestClient, settings: Settings, db: DB):
+    stub_clip(db, settings.workspace_dir, "vid_00")
+    at = (datetime.now().astimezone() + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M")
+    yt = api.post("/api/schedule", json={"clip_id": "vid_00", "platforms": ["youtube"], "at": at}).json()["scheduled"][0]["id"]
+    assert api.delete(f"/api/schedule/{yt}", headers={CSRF_HEADER: ""}).status_code == 403
+    assert db.get_scheduled(yt).status == "pending"

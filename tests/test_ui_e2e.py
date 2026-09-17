@@ -292,6 +292,23 @@ def test_ui_click_through(ui: Page, fixture_video: Path):
     page.wait_for_function("!document.querySelector('#tick-now').disabled")
     assert any(j["kind"] == "tick" and j["status"] == "done" for j in ui.state()["jobs"])
 
+    # ---- Schedule: a per-clip scheduled post via the form, listed as upcoming, cancelled from its row -------------------
+    other_id = next(c["id"] for c in ui.state()["clips"] if c["id"] != target_id)  # target is posted on youtube already
+    page.select_option("#sched-clip", other_id)
+    page.select_option("#sched-platform", "youtube")
+    page.fill("#sched-when", "2099-01-01T09:30")
+    page.click("#sched-add")
+    page.wait_for_selector("#toasts .toast-text:has-text('scheduled')")
+    page.wait_for_function("document.querySelectorAll('#scheduled-body tr').length === 1")
+    row = page.locator("#scheduled-body tr").first
+    assert row.locator("td[data-label=Status] .pill[data-status=pending]").count() == 1
+    assert row.locator("td[data-label=Clip]").inner_text().startswith(other_id)
+    assert "upcoming post" in page.locator("#scheduled-count").inner_text()
+    entries = ui.state()["scheduled"]
+    assert len(entries) == 1 and entries[0]["platform"] == "youtube" and entries[0]["status"] == "pending"
+    row.locator("button:has-text('Cancel')").click()
+    page.wait_for_function("document.querySelector('#scheduled-body tr td[data-label=Status] .pill[data-status=cancelled]') !== null")
+
     # ---- phone width: the Review toolbar (long video labels in the select) must not widen the page ---------------------------
     phone = ui.ctx.new_page()
     phone.set_viewport_size({"width": 390, "height": 800})

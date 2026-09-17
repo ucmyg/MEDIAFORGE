@@ -143,7 +143,7 @@
 
   const PILL_KIND = {
     queued: 'neutral', downloaded: 'info', transcribed: 'info', selected: 'purple', rendered: 'teal', done: 'ok', failed: 'bad',
-    candidate: 'neutral', ready: 'ok', rejected: 'bad', posted: 'info',
+    candidate: 'neutral', ready: 'ok', rejected: 'bad', posted: 'info', cancelled: 'neutral', overdue: 'warn',
     running: 'warn', pending: 'neutral', uploading: 'warn',
     OK: 'ok', WARN: 'warn', FAIL: 'bad', INFO: 'info',
     info: 'neutral', warning: 'warn', error: 'bad', debug: 'neutral', critical: 'bad',
@@ -1130,6 +1130,111 @@
     const last = $('#s-last');
     if (s.last_tick) { updateTime(last, s.last_tick); } else setText(last, 'never');
     setText($('#s-summary'), s.last_summary || '-');
+    renderScheduled(st);
+  }
+  // ---- per-clip scheduled posts --------------------------------------------------------------------------------------
+  /** Clips the form may schedule: approved (ready) or posted on one platform but not the other. */
+  function schedulable(clips) {
+    return clips.filter((c) => (c.status === 'ready' || c.status === 'posted') && PLATFORMS.some((p) => !(c.posts && c.posts[p] && c.posts[p].status === 'posted')));
+  }
+  function clipLabel(c) {
+    const hook = (c.hook || (c.meta && c.meta.title) || '').trim();
+    return hook ? `${c.id} - ${hook.length > 60 ? hook.slice(0, 57) + '...' : hook}` : c.id;
+  }
+  /** 'YYYY-MM-DDTHH:MM' in local time for <input type=datetime-local>. */
+  function localInputValue(d) {
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  }
+  function renderScheduled(st) {
+    const sel = $('#sched-clip');
+    const options = schedulable(st.clips).map((c) => [c.id, clipLabel(c)]);
+    syncOptions(sel, options.length ? options : [['', 'no approved clips - approve one in Review']], sel.value);
+    sel.disabled = !options.length;
+    const when = $('#sched-when');
+    if (!when.value) {
+      const d = new Date(Date.now() + 3600 * 1000);
+      d.setSeconds(0, 0);
+      when.value = localInputValue(d);
+    }
+    when.min = localInputValue(new Date());
+    const entries = Array.isArray(st.scheduled) ? st.scheduled : [];
+    const pending = entries.filter((e) => e.status === 'pending');
+    const done = entries.filter((e) => e.status !== 'pending');
+    const rows = [...pending, ...done];
+    show($('#scheduled-empty'), rows.length === 0);
+    show($('#scheduled-table'), rows.length > 0);
+    setText($('#scheduled-count'), rows.length ? `${plural(pending.length, 'upcoming post')}${done.length ? `, ${done.length} finished` : ''}` : '');
+    syncList($('#scheduled-body'), rows, (e) => e.id, createScheduledRow, updateScheduledRow);
+  }
+  function createScheduledRow(e) {
+    const r = {};
+    r.when = h('span', { class: 'sched-when' });
+    r.rel = h('span', { class: 'muted small' });
+    r.clip = h('span', { class: 'cell-title' });
+    r.hook = h('span', { class: 'cell-sub' });
+    r.pill = pill(e.status);
+    r.detail = h('span', { class: 'small' });
+    r.link = h('a', { target: '_blank', rel: 'noopener noreferrer', class: 'small' }, 'open post');
+    r.cancel = h('button', { class: 'btn btn-sm btn-danger', type: 'button', onClick: () => cancelScheduled(e.id, r.cancel) }, 'Cancel');
+    const tr = h('tr', {},
+      h('td', { 'data-label': 'When' }, r.when, r.rel),
+      h('td', { 'data-label': 'Clip' }, r.clip, h('br'), r.hook),
+      h('td', { 'data-label': 'Platform' }),
+      h('td', { 'data-label': 'Status' }, r.pill),
+      h('td', { 'data-label': 'Detail' }, r.detail, r.link),
+      h('td', { 'data-label': 'Actions', class: 'actions' }, r.cancel));
+    tr._refs = r;
+    return tr;
+  }
+  function updateScheduledRow(tr, e) {
+    const r = tr._refs;
+    const overdue = e.status === 'pending' && parseTs(e.run_at) && parseTs(e.run_at).getTime() < Date.now() - 60000;
+    tr.dataset.overdue = overdue ? 'true' : 'false';
+    tr.dataset.status = e.status;
+    setText(r.when, absTime(e.run_at));
+    setText(r.rel, e.status === 'pending' ? (overdue ? ` ${relTime(e.run_at)} - waiting for the next tick` : ` ${relTime(e.run_at)}`) : '');
+    setText(r.clip, e.clip_id);
+    setText(r.hook, e.hook || '');
+    setText(tr.children[2], PLATFORM_LABEL[e.platform] || e.platform);
+    updatePill(r.pill, e.status);
+    const detail = e.status === 'failed' ? (e.error || 'failed') : e.status === 'posted' ? (e.post_id || 'posted') : e.status === 'cancelled' ? 'cancelled' : (e.clip_status && e.clip_status !== 'ready' && e.clip_status !== 'posted' ? `clip is ${e.clip_status}` : '');
+    setText(r.detail, detail);
+    r.detail.classList.toggle('post-err', e.status === 'failed');
+    const url = e.url ? safeHref(e.url) : '#';
+    show(r.link, e.status === 'posted' && url !== '#');
+    if (url !== '#') r.link.href = url;
+    show(r.cancel, e.status === 'pending');
+  }
+  async function addScheduled(ev) {
+    ev.preventDefault();
+    const f = ev.target;
+    const err = $('#schedule-error');
+    showErr(err, '');
+    const clipId = f.elements.clip_id.value;
+    const at = f.elements.at.value;
+    const choice = f.elements.platform.value;
+    const platforms = choice === 'both' ? [...PLATFORMS] : [choice];
+    if (!clipId) { showErr(err, 'Pick an approved clip first (Review tab).'); return; }
+    if (!at) { showErr(err, 'Pick a date and time.'); return; }
+    const btn = $('#sched-add');
+    setPending(btn, true);
+    try {
+      const r = await api('POST', '/api/schedule', { clip_id: clipId, platforms, at });
+      const added = (r && r.scheduled) || [];
+      const errors = (r && r.errors) || [];
+      if (added.length) toast(`scheduled ${clipId} -> ${added.map((e) => PLATFORM_LABEL[e.platform] || e.platform).join(', ')} at ${absTime(added[0].run_at)}`, 'ok', 5000);
+      if (errors.length) showErr(err, errors.map((e) => `${PLATFORM_LABEL[e.platform] || e.platform}: ${e.detail}`).join(' '));
+      refresh();
+    } catch (e) { showErr(err, e.message); } finally { setPending(btn, false); }
+  }
+  async function cancelScheduled(id, btn) {
+    setPending(btn, true);
+    try {
+      await api('DELETE', `/api/schedule/${enc(id)}`);
+      toast('scheduled post cancelled', 'ok');
+      refresh();
+    } catch (e) { toast(e.message, 'error'); setPending(btn, false); }
   }
   /** next_slot values are 'HH:MM' (the slot the scheduler acts on next; `due` = it has opened and a post is pending now);
    *  a full timestamp is shown with its relative time. */
@@ -1335,6 +1440,7 @@
     });
     $('#manual-dialog').addEventListener('close', () => { S.manual = null; });
     $('#sched-toggle').addEventListener('click', toggleScheduler);
+    $('#schedule-form').addEventListener('submit', addScheduled);
     $('#tick-now').addEventListener('click', () => runTick(false));
     $('#tick-dry').addEventListener('click', () => runTick(true));
     $('#doctor-run').addEventListener('click', runDoctor);

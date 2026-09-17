@@ -2,7 +2,7 @@
 
 Routes (JSON everywhere, errors as HTTP 4xx with {"detail": str}, timestamps ISO-8601 strings, ids strings):
   GET  /                                   the SPA (static/index.html); /static/* -> app.js, style.css
-  GET  /api/state                          videos, clips (+meta, +posts), jobs, scheduler, settings in one poll
+  GET  /api/state                          videos, clips (+meta, +posts), jobs, scheduler, scheduled, settings in one poll
   POST /api/videos                         queue a URL / local file with per-video options
   POST /api/videos/{id}/run                background job: pipeline.process_video
   POST /api/run                            background job: pipeline.process_queue
@@ -15,6 +15,8 @@ Routes (JSON everywhere, errors as HTTP 4xx with {"detail": str}, timestamps ISO
   POST /api/auth/{platform}/start          youtube -> job running the OAuth flow; tiktok -> {auth_url, state}
   POST /api/auth/tiktok/complete           paste-back of the redirect URL -> token saved
   POST /api/scheduler                      start/stop the tick loop thread
+  POST /api/schedule                       {clip_id, platforms, at} -> per-clip scheduled posts (the tick posts them when due)
+  DELETE /api/schedule/{id}                cancel a pending scheduled post
   POST /api/tick                           {dry_run: true} -> the report inline; otherwise a background job: one pass now
   GET  /api/doctor  GET /api/logs  GET/PUT /api/settings (raw clipforge.yaml, validated through Settings)
   GET/HEAD /media/{video_id}/clips/{file}  the rendered mp4 (Range requests supported for seeking)
@@ -146,6 +148,12 @@ class TikTokCompleteBody(BaseModel):
 
 class SchedulerBody(BaseModel):
     running: bool
+
+
+class ScheduleBody(BaseModel):
+    clip_id: str = Field(min_length=1, max_length=200)
+    platforms: list[str] = Field(min_length=1, max_length=len(PLATFORMS))
+    at: str = Field(min_length=1, max_length=64)  # 'YYYY-MM-DDTHH:MM' from <input type=datetime-local> (local time) or ISO 8601
 
 
 class TickBody(BaseModel):
@@ -495,6 +503,7 @@ def _settings_block(settings: Settings) -> dict[str, Any]:
     }
 
 
+STATE_SCHEDULED_DONE = 50  # posted/failed/cancelled entries kept in /api/state (all pending ones are always there)
 STATE_CLIPS_DEFAULT = 500  # clips per /api/state unless ?video= narrows it or ?clips_limit= changes it (0 = all)
 STATE_VIDEOS_DEFAULT = 500
 
@@ -526,10 +535,25 @@ def _state_payload(st: Any, *, video: str | None = None, clips_limit: int = STAT
         "clips": [serialize.clip_dict(c, {p: posts.get((c.id, p)) for p in PLATFORMS}, serialize.load_meta(c)) for c in clips],
         "jobs": [j.to_dict() for j in st.jobs.list()],
         "scheduler": _scheduler_block(st),
+        "scheduled": _scheduled_block(db),
         "settings": _settings_block(settings),
         "totals": {"videos": len(all_videos), "clips": total_clips},
         "truncated": {"videos": videos_truncated, "clips": clips_truncated},
     }
+
+
+def _scheduled_block(db: DB) -> list[dict[str, Any]]:
+    """Every pending entry (the upcoming queue) plus the most recent finished ones, newest first among those."""
+    pending = db.list_scheduled(status="pending")
+    done = db.list_scheduled(status=["posted", "failed", "cancelled"])
+    done = sorted(done, key=lambda e: (e.updated_at, e.id), reverse=True)[:STATE_SCHEDULED_DONE]
+    clips: dict[str, Clip | None] = {}
+    out = []
+    for entry in pending + done:
+        if entry.clip_id not in clips:
+            clips[entry.clip_id] = db.get_clip(entry.clip_id)
+        out.append(serialize.scheduled_dict(entry, clips[entry.clip_id]))
+    return out
 
 
 # ---- job functions -------------------------------------------------------------------------------------------------------------
@@ -933,6 +957,41 @@ def _register_routes(app: FastAPI) -> None:  # noqa: C901 - one closure per rout
         if changed:
             st.db.log("schedule.ui", "scheduler loop started" if body.running else "scheduler loop stopped")
         return _scheduler_block(st)
+
+    @app.post("/api/schedule")
+    def add_scheduled(body: ScheduleBody) -> dict[str, Any]:
+        """Queue clip_id for every platform in `platforms` at `at`. Per-platform refusals come back in `errors`;
+        the response is 409 only when nothing could be scheduled."""
+        settings, db = st.settings, st.db
+        try:
+            when = S.parse_when(body.at)
+        except ValueError as err:
+            raise HTTPException(400, str(err))
+        names = [p.strip().lower() for p in body.platforms if p.strip()]
+        unknown = [p for p in names if p not in PLATFORMS]
+        if unknown:
+            raise HTTPException(400, f"unknown platform(s): {', '.join(unknown)}")
+        _clip_or_404(db, body.clip_id)
+        added, errors = [], []
+        for name in dict.fromkeys(names):
+            try:
+                entry = S.schedule_post(settings, db, body.clip_id, name, when)
+            except ValueError as err:
+                errors.append({"platform": name, "detail": str(err)})
+                continue
+            added.append(serialize.scheduled_dict(entry, db.get_clip(body.clip_id)))
+        if not added:
+            raise HTTPException(409, "; ".join(f"{e['platform']}: {e['detail']}" for e in errors))
+        return {"scheduled": added, "errors": errors}
+
+    @app.delete("/api/schedule/{entry_id}")
+    def cancel_scheduled(entry_id: int) -> dict[str, Any]:
+        db = st.db
+        try:
+            entry = S.cancel_scheduled(db, entry_id)
+        except ValueError as err:
+            raise HTTPException(404 if "no scheduled post" in str(err) else 409, str(err))
+        return serialize.scheduled_dict(entry, db.get_clip(entry.clip_id))
 
     @app.post("/api/tick")
     def tick(body: TickBody | None = None) -> dict[str, Any]:

@@ -283,6 +283,13 @@ table.publish th { white-space: nowrap; }
 .activity .act-detail { grid-column: 1 / -1; color: var(--muted); overflow-wrap: anywhere; }
 .log-file-box summary { cursor: pointer; color: var(--muted); font-size: var(--text-sm); }
 .log-file { max-height: 260px; overflow: auto; margin-top: var(--sp-2); padding: var(--sp-2); border-radius: var(--radius-sm); background: var(--bg); color: var(--muted); }
+.schedule-form { align-items: flex-end; gap: var(--sp-2) var(--sp-3); }
+.schedule-form .inline-field { flex-direction: column; align-items: flex-start; gap: var(--sp-1); min-width: 0; max-width: 100%; }
+.schedule-form input, .schedule-form select { max-width: 100%; }
+.schedule-form .form-error { flex-basis: 100%; }
+.sched-when { white-space: nowrap; }
+.sched-when .muted { display: block; white-space: nowrap; }
+tr[data-overdue="true"] .sched-when { color: var(--warn); }
 .sched-state { display: inline-flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-3); border-radius: var(--radius-pill); background: var(--card); border: 1px solid var(--line); font-size: var(--text-sm); font-weight: 600; }
 
 /* ---- publish ------------------------------------------------------------- */

@@ -79,6 +79,20 @@ CREATE TABLE IF NOT EXISTS kv (
   key TEXT PRIMARY KEY,
   value TEXT
 );
+-- "post THIS clip on THIS platform at THIS time": the scheduler posts due rows first, then falls back to the slots
+CREATE TABLE IF NOT EXISTS scheduled (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  clip_id TEXT NOT NULL REFERENCES clips(id),
+  platform TEXT NOT NULL,
+  run_at TEXT NOT NULL,                     -- UTC ISO
+  status TEXT NOT NULL DEFAULT 'pending',   -- pending|posted|failed|cancelled
+  post_id TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS scheduled_unique_pending ON scheduled(clip_id, platform) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS scheduled_status_run_at ON scheduled(status, run_at);
 """
 # Columns added after the first release; CREATE TABLE IF NOT EXISTS does not add them to existing workspace DBs.
 MIGRATIONS = {"posts": {"claimed_at": "TEXT"}}
@@ -135,6 +149,23 @@ class Post:
     created_at: str
     posted_at: str | None
     claimed_at: str | None = None
+
+
+@dataclass
+class Scheduled:
+    id: int
+    clip_id: str
+    platform: str
+    run_at: str
+    status: str
+    post_id: str | None
+    error: str | None
+    created_at: str
+    updated_at: str
+
+
+def _row_scheduled(r: sqlite3.Row) -> Scheduled:
+    return Scheduled(**{k: r[k] for k in Scheduled.__dataclass_fields__})
 
 
 def _row_video(r: sqlite3.Row) -> Video:
@@ -442,6 +473,77 @@ class DB:
         with self.connect() as c:
             r = c.execute("SELECT MAX(posted_at) AS m FROM posts WHERE platform=? AND status='posted'", (platform,)).fetchone()
             return r["m"] if r and r["m"] else None
+
+    # ---- scheduled posts (per-clip date/time) -------------------------
+    def add_scheduled(self, clip_id: str, platform: str, run_at_iso: str) -> Scheduled:
+        """Queue clip_id for platform at run_at (UTC ISO). ValueError when a pending entry for the pair exists."""
+        now = utcnow()
+        with self.connect(immediate=True) as c:
+            try:
+                cur = c.execute(
+                    "INSERT INTO scheduled (clip_id, platform, run_at, status, created_at, updated_at) VALUES (?,?,?,'pending',?,?)",
+                    (clip_id, platform, run_at_iso, now, now),
+                )
+            except sqlite3.IntegrityError as err:
+                if "scheduled_unique_pending" in str(err) or "UNIQUE" in str(err).upper():
+                    raise ValueError(f"clip {clip_id} is already scheduled on {platform}; cancel that entry first") from None
+                raise
+            row = c.execute("SELECT * FROM scheduled WHERE id=?", (cur.lastrowid,)).fetchone()
+            return _row_scheduled(row)
+
+    def get_scheduled(self, id: int) -> Scheduled | None:
+        with self.connect() as c:
+            r = c.execute("SELECT * FROM scheduled WHERE id=?", (id,)).fetchone()
+            return _row_scheduled(r) if r else None
+
+    def list_scheduled(self, status: str | list[str] | None = None, platform: str | None = None, clip_id: str | None = None, limit: int | None = None) -> list[Scheduled]:
+        """Entries ordered by run_at (pending ones read as the upcoming queue)."""
+        where, args = [], []
+        if status:
+            statuses = [status] if isinstance(status, str) else list(status)
+            where.append(f"status IN ({','.join('?' * len(statuses))})")
+            args.extend(statuses)
+        if platform:
+            where.append("platform=?")
+            args.append(platform)
+        if clip_id:
+            where.append("clip_id=?")
+            args.append(clip_id)
+        sql = "SELECT * FROM scheduled" + (" WHERE " + " AND ".join(where) if where else "") + " ORDER BY run_at, id"
+        if limit:
+            sql += f" LIMIT {int(limit)}"
+        with self.connect() as c:
+            return [_row_scheduled(r) for r in c.execute(sql, args).fetchall()]
+
+    def due_scheduled(self, now_iso: str) -> list[Scheduled]:
+        """Pending entries whose time has come, earliest first."""
+        with self.connect() as c:
+            rows = c.execute("SELECT * FROM scheduled WHERE status='pending' AND run_at<=? ORDER BY run_at, id", (now_iso,)).fetchall()
+            return [_row_scheduled(r) for r in rows]
+
+    def reserved_clips(self, platform: str) -> set[str]:
+        """Clips with a pending scheduled entry on `platform`: the slot scheduler must leave them alone."""
+        with self.connect() as c:
+            return {r["clip_id"] for r in c.execute("SELECT clip_id FROM scheduled WHERE status='pending' AND platform=?", (platform,)).fetchall()}
+
+    def count_scheduled_between(self, platform: str, start_iso: str, end_iso: str, exclude_id: int | None = None) -> int:
+        """Pending entries on `platform` with run_at in [start, end): the per-day cap must count them too."""
+        with self.connect() as c:
+            r = c.execute(
+                "SELECT COUNT(*) AS n FROM scheduled WHERE status='pending' AND platform=? AND run_at>=? AND run_at<? AND id<>?",
+                (platform, start_iso, end_iso, exclude_id if exclude_id is not None else -1),
+            ).fetchone()
+            return int(r["n"])
+
+    def set_scheduled(self, id: int, status: str, *, post_id: str | None = None, error: str | None = None) -> None:
+        with self.connect() as c:
+            c.execute("UPDATE scheduled SET status=?, post_id=?, error=?, updated_at=? WHERE id=?", (status, post_id, error, utcnow(), id))
+
+    def cancel_scheduled(self, id: int) -> bool:
+        """Cancel a pending entry; False when it is not pending (already posted / failed / cancelled / unknown)."""
+        with self.connect(immediate=True) as c:
+            cur = c.execute("UPDATE scheduled SET status='cancelled', updated_at=? WHERE id=? AND status='pending'", (utcnow(), id))
+            return cur.rowcount == 1
 
     # ---- budget --------------------------------------------------------
     def budget_used(self, platform: str, day: str) -> int:

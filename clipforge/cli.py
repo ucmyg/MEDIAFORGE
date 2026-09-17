@@ -1,4 +1,4 @@
-"""Typer CLI. Commands: add, run, review, publish, daemon, tick, auth, doctor, fixture, init-config.
+"""Typer CLI. Commands: add, run, review, publish, schedule (add/list/cancel), daemon, tick, auth, doctor, fixture, init-config.
 
 Thin by design: every command maps arguments onto one module call and prints the result with rich. Expected errors
 end in `typer.Exit` with a code (2 = usage, 1 = failure); no tracebacks.
@@ -29,6 +29,8 @@ if TYPE_CHECKING:
     from .publish.base import Publisher
 
 app = typer.Typer(name="clipforge", help="Long-form video -> captioned vertical clips -> YouTube Shorts / TikTok. Local and free.", no_args_is_help=True)
+schedule_app = typer.Typer(name="schedule", help="Post a specific clip at a specific date and time (the daemon/tick does the posting).", no_args_is_help=True)
+app.add_typer(schedule_app, name="schedule")
 
 EXIT_FAILED = 1
 EXIT_USAGE = 2
@@ -59,6 +61,82 @@ def _settings(ctx: typer.Context) -> Settings:
 
 def _open_db(settings: Settings) -> DB:
     return DB(settings.db_path)
+
+
+# ---- schedule: per-clip date/time -------------------------------------------
+@schedule_app.command("add")
+def schedule_add(
+    ctx: typer.Context,
+    clip_id: str = typer.Argument(..., help="An approved (ready) clip id, e.g. abc123_02."),
+    at: str = typer.Option(..., "--at", help="Local date and time, 'YYYY-MM-DD HH:MM' (or ISO 8601 with an offset)."),
+    to: str = typer.Option("youtube", "--to", help="Comma-separated platforms: youtube,tiktok."),
+) -> None:
+    """Queue one clip for a specific time; `clipforge daemon` or `clipforge tick` posts it when the time comes."""
+    from . import scheduler
+
+    settings = _settings(ctx)
+    db = _open_db(settings)
+    try:
+        when = scheduler.parse_when(at)
+    except ValueError as err:
+        _fail(str(err), EXIT_USAGE)
+    failed = False
+    for platform in _platforms(to):
+        try:
+            entry = scheduler.schedule_post(settings, db, clip_id, platform, when)
+        except ValueError as err:
+            console.print(f"[red]{escape(platform)}:[/] {escape(str(err))}")
+            failed = True
+            continue
+        console.print(f"scheduled #{entry.id}: {escape(clip_id)} -> {escape(platform)} at {when.strftime('%Y-%m-%d %H:%M')} (keep `clipforge daemon` or a `clipforge tick` job running)")
+    if failed:
+        raise typer.Exit(EXIT_FAILED)
+
+
+@schedule_app.command("list")
+def schedule_list(ctx: typer.Context, all_: bool = typer.Option(False, "--all", help="Include posted, failed and cancelled entries.")) -> None:
+    """Upcoming scheduled posts (pending), or everything with --all."""
+    settings = _settings(ctx)
+    db = _open_db(settings)
+    entries = db.list_scheduled(status=None if all_ else "pending")
+    if not entries:
+        console.print("no scheduled posts" + ("" if all_ else " pending (clipforge schedule add CLIP --at 'YYYY-MM-DD HH:MM' --to youtube)"))
+        return
+    table = Table(title="scheduled posts", expand=False)
+    for col in ("#", "when (local)", "clip", "platform", "status", "detail"):
+        table.add_column(col, no_wrap=col != "detail", overflow="fold" if col == "detail" else "ellipsis")
+    for e in entries:
+        when = _local_hm(e.run_at)
+        detail = e.post_id or e.error or ""
+        colour = {"pending": "yellow", "posted": "green", "failed": "red", "cancelled": "dim"}.get(e.status, "")
+        table.add_row(str(e.id), when, escape(e.clip_id), escape(e.platform), f"[{colour}]{e.status}[/]" if colour else e.status, escape(detail))
+    console.print(table)
+
+
+@schedule_app.command("cancel")
+def schedule_cancel(ctx: typer.Context, entry_id: int = typer.Argument(..., help="The # from `clipforge schedule list`.")) -> None:
+    """Cancel a pending scheduled post (the clip stays approved and goes back to the normal slot rotation)."""
+    from . import scheduler
+
+    settings = _settings(ctx)
+    db = _open_db(settings)
+    try:
+        entry = scheduler.cancel_scheduled(db, entry_id)
+    except ValueError as err:
+        _fail(str(err), EXIT_USAGE)
+    console.print(f"cancelled #{entry.id}: {escape(entry.clip_id)} -> {escape(entry.platform)} at {_local_hm(entry.run_at)}")
+
+
+def _local_hm(iso_utc: str) -> str:
+    from datetime import datetime, timezone
+
+    try:
+        parsed = datetime.fromisoformat(iso_utc)
+    except ValueError:
+        return iso_utc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 def _passed(**options: Any) -> dict[str, Any]:

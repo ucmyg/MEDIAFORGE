@@ -230,9 +230,27 @@
           <button class="btn btn-primary" id="sched-toggle" type="button">Start scheduler</button>
         </div>
       </header>
+      <section class="card">
+        <div class="card-head"><h2>Upcoming posts</h2><span class="muted small" id="scheduled-count"></span></div>
+        <p class="muted small">Pick an approved clip, a platform and a time. The scheduler (running here, or `clipforge daemon` / `tick`) posts it then, on top of the daily slots below.</p>
+        <form id="schedule-form" class="row wrap schedule-form" autocomplete="off" novalidate>
+          <label class="inline-field">Clip <select id="sched-clip" name="clip_id" required></select></label>
+          <label class="inline-field">Platform <select id="sched-platform" name="platform"><option value="youtube">YouTube</option><option value="tiktok">TikTok</option><option value="both">both</option></select></label>
+          <label class="inline-field">When <input id="sched-when" name="at" type="datetime-local" required step="60"></label>
+          <button class="btn btn-primary" type="submit" id="sched-add">Schedule post</button>
+          <p class="form-error" id="schedule-error" role="alert" hidden></p>
+        </form>
+        <p class="empty" id="scheduled-empty">Nothing scheduled - ready clips are posted at the daily slots instead.</p>
+        <div class="table-wrap">
+          <table class="stack" id="scheduled-table" hidden>
+            <thead><tr><th scope="col">When</th><th scope="col">Clip</th><th scope="col">Platform</th><th scope="col">Status</th><th scope="col">Detail</th><th scope="col">Actions</th></tr></thead>
+            <tbody id="scheduled-body"></tbody>
+          </table>
+        </div>
+      </section>
       <div class="two-col">
         <section class="card">
-          <h2>Scheduler</h2>
+          <h2>Daily slots</h2>
           <dl class="facts-list">
             <dt>Tick interval</dt><dd id="s-tick">-</dd>
             <dt>Post times</dt><dd id="s-times">-</dd>

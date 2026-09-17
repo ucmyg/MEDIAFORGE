@@ -52,7 +52,7 @@ A local single-page app over the same engine, no accounts, no internet needed fo
 | Dashboard | totals at a glance (videos, clips to review, ready, posted), paste a URL or local path with the clip options, run the queue, watch video status and job progress |
 | Review | watch every clip, approve / reject (keys A / R), edit title, description and hashtags |
 | Publish | connect YouTube (Google sign-in opens on this machine) or TikTok (paste the redirect URL back into the page), publish selected clips, or use the manual dialog: copy caption, open the upload page, download the clip, mark as posted |
-| Schedule | start/stop the scheduler inside the UI process, see next slots and limits, run a tick or a dry run, recent activity log |
+| Schedule | schedule a specific clip for a specific date and time, see and cancel upcoming posts, start/stop the scheduler inside the UI process, see next slots and limits, run a tick or a dry run, recent activity log |
 | Settings | environment check (doctor) and a validated editor for `clipforge.yaml` |
 
 `GET /api/health` answers `{status: ok}` for liveness; `GET /api/health?ready=1` also checks SQLite, ffmpeg and the
@@ -86,6 +86,7 @@ succeeds), AAC 128 kbps, `+faststart`. No logos, watermarks or promo text are ev
 | `clipforge publish` | `--to youtube,tiktok`, `--now` / `--schedule` (default: leave for the daemon), `--manual`, `--clip-id ID`, `--i-accept-the-risk` |
 | `clipforge auth youtube\|tiktok` | interactive OAuth; tokens land in the workspace |
 | `clipforge tick` | one scheduler pass (`--dry-run`) for cron / Task Scheduler |
+| `clipforge schedule add CLIP --at "2026-09-20 18:00" --to youtube` | post one clip at one time (`schedule list`, `schedule cancel N`) |
 | `clipforge daemon` | tick every `schedule.tick_s` seconds until Ctrl-C |
 | `clipforge doctor` | environment + credential checks; exit 1 on a hard failure |
 | `clipforge fixture out.mp4 --seconds 120` | synthetic demo video with caption sidecar |
@@ -218,6 +219,24 @@ one attempt per window rather than the whole queue. Every action is written to t
 */5 * * * *  cd /path/to/clipforge && .venv/bin/clipforge tick                                       # cron
 schtasks /Create /SC MINUTE /MO 5 /TN ClipForge /TR "C:\path\.venv\Scripts\clipforge.exe tick"      # Windows
 ```
+
+### Scheduling a specific clip for a specific time
+
+The daily slots pick the oldest approved clip. To choose the clip and the moment yourself:
+
+```bash
+clipforge schedule add abc123_02 --at "2026-09-20 18:00" --to youtube      # local time; --to youtube,tiktok for both
+clipforge schedule list                                                     # upcoming posts, with their ids
+clipforge schedule cancel 3                                                 # back to the normal slot rotation
+```
+
+The same lives on the **Schedule** tab of the web UI ("Upcoming posts": clip, platform, date and time, Cancel). A
+scheduled post is carried out by whichever scheduler is running (the UI's Start scheduler, `clipforge daemon` or a
+`clipforge tick` job) on the first tick at or after its time; it ignores `min_gap_h` (the time is your choice) but
+still needs an approved clip, working credentials, the platform's `per_day` cap (checked when you schedule, for that
+day) and the YouTube quota. While an entry is pending its clip is reserved: the daily slots leave it alone. Transient
+failures retry with the usual backoff; a final failure, a clip rejected in the meantime, or an entry more than 12 h
+overdue (no scheduler was running) is marked failed with the reason, and the clip goes back to the slot rotation.
 
 ## Backup and restore
 
