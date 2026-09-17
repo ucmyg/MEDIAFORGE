@@ -124,3 +124,38 @@ def test_style_has_dark_default_and_light_mode():
     assert "--bg:" in css and "--ink:" in css
     assert "@import" not in css and "url(" not in css.replace("url(data:", "")
     assert "max-width: 900px" in css or "max-width:900px" in css  # phone layout breakpoint
+
+
+# ---- hardening batch 4: contrast, pending states -------------------------------------------------------------------
+def _lum(hexv: str) -> float:
+    h = hexv.lstrip("#")
+    r, g, b = (int(h[i : i + 2], 16) / 255 for i in (0, 2, 4))
+    f = lambda c: c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4  # noqa: E731
+    return 0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+
+
+def _ratio(a: str, b: str) -> float:
+    la, lb = _lum(a), _lum(b)
+    return (max(la, lb) + 0.05) / (min(la, lb) + 0.05)
+
+
+def test_text_tokens_meet_wcag_aa_in_both_themes():
+    """Every colour used for text (ink, muted, accent links, status colours) reads at >= 4.5:1 on every surface."""
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    blocks = re.findall(r"(:root|@media \(prefers-color-scheme: light\) \{\s*:root)\s*\{([^}]*)\}", css)
+    assert len(blocks) == 2, "expected a dark :root and a light :root block"
+    for name, body in blocks:
+        tokens = dict(re.findall(r"--([a-z0-9-]+):\s*(#[0-9a-fA-F]{6})", body))
+        for fg in ("ink", "muted", "accent", "ok", "warn", "bad", "info", "purple", "teal"):
+            for bg in ("bg", "bg-2", "card", "card-2"):
+                r = _ratio(tokens[fg], tokens[bg])
+                assert r >= 4.5, f"{name.strip()[:12]}: --{fg} on --{bg} is {r:.2f}:1 (< 4.5)"
+        assert _ratio(tokens["accent-ink"], tokens["accent"]) >= 4.5  # primary button label
+
+
+def test_pending_state_helper_is_used_instead_of_bare_disabled():
+    js = (STATIC / "app.js").read_text(encoding="utf-8")
+    assert "function setPending(el, on)" in js and "aria-busy" in js
+    assert not re.search(r"\b(btn|submit|r\.save)\.disabled = (true|false);", js), "use setPending() so aria-busy follows disabled"
+    css = (STATIC / "style.css").read_text(encoding="utf-8")
+    assert '[aria-busy="true"]' in css and "prefers-reduced-motion" in css

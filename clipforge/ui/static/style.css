@@ -33,14 +33,14 @@
     --line: #d8dee8;
     --ink: #161b22;
     --muted: #5c6675;
-    --accent: #2f6fed;
+    --accent: #2165ec; /* 4.65:1 on --bg (was #2f6fed, 4.16:1) */
     --accent-ink: #ffffff;
     --ok: #1a7f37;
-    --warn: #9a6700;
+    --warn: #956400; /* 4.69:1 on --bg (was 4.46:1) */
     --bad: #cf222e;
     --info: #0969da;
     --purple: #6f42c1;
-    --teal: #0f8a83;
+    --teal: #0e7c76; /* 4.62:1 on --bg (was 3.86:1) */
     --shadow: 0 1px 2px rgba(16, 24, 40, .06), 0 8px 24px rgba(16, 24, 40, .06);
   }
 }
@@ -289,7 +289,7 @@ dialog p { margin: 0; }
     height: auto; flex-direction: row; align-items: center; gap: 8px; padding: 8px 12px; border-right: 0; border-bottom: 1px solid var(--line);
     overflow-x: auto; z-index: 30;
   }
-  .tabs { flex-direction: row; gap: 2px; }
+  .tabs { flex-direction: row; gap: 2px; overflow-x: auto; scrollbar-width: thin; -webkit-overflow-scrolling: touch; padding-bottom: 2px; }
   .tab { padding: 7px 9px; font-size: 14px; white-space: nowrap; }
   .tab[aria-selected="true"] { box-shadow: inset 0 -3px 0 var(--accent); }
   .nav-busy { margin-top: 0; margin-left: auto; padding: 4px 6px; }
@@ -316,3 +316,12 @@ dialog p { margin: 0; }
 /* TikTok posting choices */
 .posting-form { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border, rgba(128,128,128,.3)); display: grid; gap: 10px; }
 .posting-form h3 { margin: 0; font-size: 1rem; }
+
+/* pending state: a control that is waiting for the server (set by setPending in app.js) */
+[aria-busy="true"] { cursor: progress; position: relative; color: transparent !important; }
+[aria-busy="true"]::after {
+  content: ""; position: absolute; inset: 0; margin: auto; width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid currentColor; border-right-color: transparent; color: var(--ink); animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { [aria-busy="true"]::after { animation: none; border-right-color: currentColor; opacity: .5; } }

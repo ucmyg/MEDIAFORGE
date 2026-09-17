@@ -31,6 +31,10 @@ when a browser sent them, a same-site Origin / Sec-Fetch-Site (closes cross-site
 """
 from __future__ import annotations
 
+import logging
+
+import uuid
+
 import inspect
 import mimetypes
 import os
@@ -175,6 +179,7 @@ def create_app(settings: Settings, db: DB, *, static_dir: Path | None = None, al
     _register_routes(app)
     app.mount("/static", _RevalidatedStaticFiles(directory=str(st.static_dir), check_dir=False), name="static")
     app.add_middleware(_RequestGuard, allowed_hosts=set(LOOPBACK_HOSTS) | {h.lower() for h in (allowed_hosts or ())})
+    app.add_middleware(_RequestLog)  # outermost: times the guard too
     return app
 
 
@@ -187,6 +192,43 @@ def _hostname(value: str | None) -> str:
         return (urlsplit(value if "//" in value else "//" + value).hostname or "").lower()
     except ValueError:
         return ""
+
+
+class _RequestLog:
+    """Pure-ASGI access log: request id, method, route, status, duration. No query strings, bodies or headers are
+    logged (the TikTok redirect URL and settings YAML travel there). Polling and media routes log at DEBUG so the
+    2-second /api/state poll does not flood logs/clipforge.log; everything else at INFO; 5xx at ERROR."""
+
+    QUIET = ("/api/state", "/media/", "/static/", "/api/health")
+
+    def __init__(self, app: Any):
+        self.app = app
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        rid = uuid.uuid4().hex[:12]
+        started = time.perf_counter()
+        status = {"code": 0}
+
+        async def send_wrapped(message: Any) -> None:
+            if message.get("type") == "http.response.start":
+                status["code"] = int(message.get("status", 0))
+                headers = list(message.get("headers") or [])
+                headers.append((b"x-request-id", rid.encode()))
+                message = {**message, "headers": headers}
+            await send(message)
+
+        path = scope.get("path", "")
+        try:
+            await self.app(scope, receive, send_wrapped)
+        except Exception:
+            log.exception("rid=%s %s %s -> unhandled error after %.0f ms", rid, scope.get("method"), path, (time.perf_counter() - started) * 1000)
+            raise
+        ms = (time.perf_counter() - started) * 1000
+        level = logging.ERROR if status["code"] >= 500 else logging.DEBUG if path.startswith(self.QUIET) else logging.INFO
+        log.log(level, "rid=%s %s %s -> %d in %.0f ms", rid, scope.get("method"), path, status["code"], ms)
 
 
 class _RequestGuard:

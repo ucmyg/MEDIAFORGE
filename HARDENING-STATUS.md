@@ -47,4 +47,18 @@ done in-session. Full suite: `pytest` (444+ tests, ~31 s).
 - Verification: new tests (bounded state, video filter, deterministic order, global counts, cache freshness after
   PUT/corruption/deletion, index use via EXPLAIN, old DB gains indexes on open); full suite 459 passed.
 
-## Next batch — 4: contrast + 375/768/1280 overflow check, pending states, request logging
+## Batch 4 — accessibility, pending states, request logging — DONE
+- Findings: light theme `--accent` 4.16:1, `--warn` 4.46:1, `--teal` 3.86:1 on the page background (below AA);
+  buttons were disabled during requests without an accessible pending state; at 375 px the top tab bar clipped the
+  Settings tab (unreachable by pointer); no request correlation in logs.
+- Changes: light tokens `#2165ec` / `#956400` / `#0e7c76` (all >= 4.6:1 on every surface; dark theme already >= 5:1);
+  `setPending()` sets `disabled` + `aria-busy` on 11 in-flight controls with a CSS spinner that respects
+  `prefers-reduced-motion`; mobile tab bar scrolls horizontally; `_RequestLog` ASGI middleware adds
+  `X-Request-ID`, logs method/route/status/duration (no query strings, bodies or headers; poll/media/static/health
+  routes at DEBUG, 5xx at ERROR) (`ui/static/style.css`, `ui/static/app.js`, `ui/server.py`).
+- Evidence: headless Chromium (preinstalled build) against the real server at 375/768/1280 px on all five tabs:
+  no page overflow, no console errors, keyboard tab order starts at Run queue -> Add video fields; contrast test
+  computes every text token on every surface in both themes; request-id/log tests.
+- Verification: full suite 462 passed. Screenshots in the session scratchpad (not committed).
+
+## Next batch — 5: backup/restore command + exercised restore, bounded local load smoke

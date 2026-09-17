@@ -997,3 +997,21 @@ def test_meta_cache_serves_fresh_data_after_edits(api: TestClient, settings: Set
     assert api.get("/api/state").json()["clips"][0]["meta"] is None
     Path(clip.meta_path).unlink()
     assert api.get("/api/state").json()["clips"][0]["meta"] is None and str(clip.meta_path) not in serialize._meta_cache
+
+
+# ---- hardening batch 4: request log -----------------------------------------------------------------------------------
+def test_every_response_carries_a_request_id_and_access_log_line(api: TestClient, caplog):
+    import logging as _logging
+
+    caplog.set_level(_logging.DEBUG, logger="clipforge.ui.server")
+    res = api.get("/api/health")
+    rid = res.headers.get("x-request-id")
+    assert rid and len(rid) == 12
+    quiet = [r for r in caplog.records if f"rid={rid}" in r.getMessage()]
+    assert quiet and quiet[0].levelno == _logging.DEBUG and "/api/health -> 200 in" in quiet[0].getMessage()
+    res = api.get("/api/doctor")
+    rid = res.headers["x-request-id"]
+    loud = [r for r in caplog.records if f"rid={rid}" in r.getMessage()]
+    assert loud and loud[0].levelno == _logging.INFO and "?" not in loud[0].getMessage()  # no query strings ever
+    res = api.get("/api/state", params={"video": "secret-looking-value"})
+    assert "secret-looking-value" not in "\n".join(r.getMessage() for r in caplog.records)

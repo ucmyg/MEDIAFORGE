@@ -48,6 +48,12 @@
     if (el.textContent !== t) el.textContent = t;
   }
   function show(el, on) { el.hidden = !on; }
+  /** Pending state for a control while its request is in flight: disabled (cannot activate twice) + aria-busy for AT/CSS. */
+  function setPending(el, on) {
+    if (!el) return;
+    el.disabled = !!on;
+    if (on) el.setAttribute('aria-busy', 'true'); else el.removeAttribute('aria-busy');
+  }
   function showErr(el, msg) { setText(el, msg || ''); show(el, !!msg); }
   /** Only http(s) or same-origin absolute paths may become href values (server data never becomes javascript: URLs). */
   function safeHref(url) {
@@ -490,12 +496,12 @@
   }
   async function runQueue() {
     const btn = $('#run-queue');
-    btn.disabled = true;
+    setPending(btn, true);
     try {
       const r = await api('POST', '/api/run');
       toast(`queue run started (job ${r.job_id})`, 'ok');
       refresh();
-    } catch (e) { toast(e.message, 'error'); } finally { btn.disabled = false; }
+    } catch (e) { toast(e.message, 'error'); } finally { setPending(btn, false); }
   }
   function numOrUndef(v) {
     const s = String(v ?? '').trim();
@@ -524,14 +530,14 @@
     options.punch = f.elements.punch.checked;
     options.force_whisper = f.elements.force_whisper.checked;
     const submit = f.querySelector('button[type=submit]');
-    submit.disabled = true;
+    setPending(submit, true);
     try {
       const r = await api('POST', '/api/videos', { source, options });
       showErr(errEl, '');
       if (r.created) { toast(`queued ${r.video_id}`, 'ok'); f.elements.source.value = ''; }
       else toast(`already added (${r.video_id}, ${r.status || 'in queue'})`, 'info');
       refresh();
-    } catch (e) { showErr(errEl, e.message); } finally { submit.disabled = false; }
+    } catch (e) { showErr(errEl, e.message); } finally { setPending(submit, false); }
   }
 
   function renderJobs(st) {
@@ -780,7 +786,7 @@
     const hashtags = { youtube: parseTags(r.tagsYt.value), tiktok: parseTags(r.tagsTt.value) };
     const errs = validateMeta(title, hashtags);
     if (errs.length) { showErr(r.formError, errs.join(' ')); return; }
-    r.save.disabled = true;
+    setPending(r.save, true);
     try {
       const meta = await api('PUT', `/api/clips/${enc(clipId)}/meta`, { title, description, hashtags });
       showErr(r.formError, '');
@@ -788,7 +794,7 @@
       setText(r.saveNote, `saved ${new Date().toLocaleTimeString()}`);
       toast(`metadata saved for ${clipId}`, 'ok');
       refresh();
-    } catch (e) { showErr(r.formError, e.message); } finally { r.save.disabled = false; }
+    } catch (e) { showErr(r.formError, e.message); } finally { setPending(r.save, false); }
   }
 
   // ==== Publish ========================================================================================================
@@ -900,7 +906,7 @@
     if (!clip_ids.length) { toast('select at least one clip'); return; }
     if (!platforms.length) { toast('pick at least one platform'); return; }
     const btn = $('#publish-selected');
-    btn.disabled = true;
+    setPending(btn, true);
     try {
       const r = await api('POST', '/api/publish', { clip_ids, platforms });
       S.publishJobId = r.job_id;
@@ -1011,7 +1017,7 @@
     const post_id = input.value.trim();
     if (!post_id) { showErr($('#manual-error'), 'Enter the post URL or id.'); input.focus(); return; }
     const btn = ev.currentTarget.querySelector('button[type=submit]');
-    btn.disabled = true;
+    setPending(btn, true);
     try {
       await api('POST', `/api/clips/${enc(clipId)}/posted`, { platform, post_id });
       toast(`${clipId} marked as posted on ${PLATFORM_LABEL[platform] || platform}`, 'ok');
@@ -1020,14 +1026,14 @@
       const tr = $$('#publish-body tr').find((t) => t.dataset.key === clipId); // the Manual button that opened the dialog is about to hide
       if (tr && tr._refs) tr._refs.check.focus();
       refresh();
-    } catch (e) { showErr($('#manual-error'), e.message); } finally { btn.disabled = false; }
+    } catch (e) { showErr($('#manual-error'), e.message); } finally { setPending(btn, false); }
   }
 
   // ---- auth ----------------------------------------------------------------------------------------------------------
   async function connectYouTube() {
     const btn = $('#connect-youtube');
     const errEl = $('#youtube-error'); // setup instructions are several lines: a toast is too small and too short-lived for them
-    btn.disabled = true;
+    setPending(btn, true);
     try {
       const r = await api('POST', '/api/auth/youtube/start');
       showErr(errEl, '');
@@ -1039,13 +1045,13 @@
         onFail: (j) => toast(`YouTube sign-in failed: ${j.error || 'unknown error'}`, 'error', 9000),
       });
       refresh();
-    } catch (e) { showErr(errEl, e.message); } finally { btn.disabled = false; }
+    } catch (e) { showErr(errEl, e.message); } finally { setPending(btn, false); }
   }
   async function connectTikTok() {
     const btn = $('#connect-tiktok');
     const box = $('#tiktok-auth');
     const errEl = $('#tiktok-error');
-    btn.disabled = true;
+    setPending(btn, true);
     try {
       const r = await api('POST', '/api/auth/tiktok/start');
       showErr(errEl, '');
@@ -1055,7 +1061,7 @@
       $('#tiktok-redirect').value = '';
       show(box, true);
       $('#tiktok-redirect').focus();
-    } catch (e) { show(box, false); showErr(errEl, e.message); } finally { btn.disabled = false; }
+    } catch (e) { show(box, false); showErr(errEl, e.message); } finally { setPending(btn, false); }
   }
   async function completeTikTok(ev) {
     ev.preventDefault();
@@ -1064,14 +1070,14 @@
     const errEl = $('#tiktok-error');
     if (!redirect_url) { showErr(errEl, 'Paste the URL you were redirected to.'); input.focus(); return; }
     const btn = ev.currentTarget.querySelector('button[type=submit]');
-    btn.disabled = true;
+    setPending(btn, true);
     try {
       await api('POST', '/api/auth/tiktok/complete', { redirect_url });
       showErr(errEl, '');
       show($('#tiktok-auth'), false);
       toast('TikTok connected', 'ok');
       refresh();
-    } catch (e) { showErr(errEl, e.message); } finally { btn.disabled = false; }
+    } catch (e) { showErr(errEl, e.message); } finally { setPending(btn, false); }
   }
 
   // ==== Schedule =======================================================================================================
@@ -1116,7 +1122,7 @@
   async function toggleScheduler() {
     const running = !!(S.state && S.state.scheduler && S.state.scheduler.running);
     const btn = $('#sched-toggle');
-    btn.disabled = true;
+    setPending(btn, true);
     btn._busy = true;
     try {
       const block = await api('POST', '/api/scheduler', { running: !running });
@@ -1205,7 +1211,7 @@
   async function runDoctor() {
     const btn = $('#doctor-run');
     const status = $('#doctor-status');
-    btn.disabled = true;
+    setPending(btn, true);
     status.replaceChildren(h('span', { class: 'spinner', 'aria-hidden': 'true' }), ' Running checks\u2026');
     try {
       const rows = await api('GET', '/api/doctor', undefined, { timeoutMs: 90000 });
@@ -1216,7 +1222,7 @@
       const fails = checks.filter((c) => c.status === 'FAIL').length;
       const warns = checks.filter((c) => c.status === 'WARN').length;
       setText(status, `${checks.length} checks: ${fails} failed, ${plural(warns, 'warning')}${DOT}${new Date().toLocaleTimeString()}`);
-    } catch (e) { setText(status, `environment check failed: ${e.message}`); } finally { btn.disabled = false; }
+    } catch (e) { setText(status, `environment check failed: ${e.message}`); } finally { setPending(btn, false); }
   }
   async function loadSettingsYaml(force) {
     if (S.settingsDirty && !force) return;
@@ -1234,7 +1240,7 @@
   }
   async function saveSettings() {
     const btn = $('#settings-save');
-    btn.disabled = true;
+    setPending(btn, true);
     try {
       const r = await api('PUT', '/api/settings', { yaml: $('#settings-yaml').value });
       showErr($('#settings-error'), '');
@@ -1244,7 +1250,7 @@
       toast('settings saved and reloaded', 'ok');
       S.defaultsApplied = false; // pick up new defaults for the add form
       refresh();
-    } catch (e) { showErr($('#settings-error'), e.message); } finally { btn.disabled = false; }
+    } catch (e) { showErr($('#settings-error'), e.message); } finally { setPending(btn, false); }
   }
   async function reloadSettings() {
     if (S.settingsDirty && !(await confirmDialog('Discard your unsaved edits and reload the file from disk?', 'Reload'))) return;
