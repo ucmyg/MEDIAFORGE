@@ -430,8 +430,21 @@
   }
 
   function renderDashboard(st) {
+    renderStats(st);
     renderVideos(st);
     renderJobs(st);
+  }
+  function renderStats(st) {
+    const count = (status) => st.clips.filter((c) => c.status === status).length;
+    const total = st.totals && st.totals.videos != null ? st.totals.videos : st.videos.length;
+    const queued = st.videos.filter((v) => v.status === 'queued').length;
+    const running = st.videos.filter((v) => ['downloaded', 'transcribed', 'selected', 'rendered'].includes(v.status)).length;
+    const failed = st.videos.filter((v) => v.status === 'failed').length;
+    setText($('#stat-videos'), String(total));
+    setText($('#stat-videos-sub'), running ? `${plural(running, 'video')} processing` : queued ? `${plural(queued, 'video')} queued` : failed ? `${plural(failed, 'video')} failed` : total ? 'all processed' : 'none queued');
+    setText($('#stat-rendered'), String(count('rendered')));
+    setText($('#stat-ready'), String(count('ready')));
+    setText($('#stat-posted'), String(count('posted')));
   }
 
   function renderVideos(st) {
@@ -636,10 +649,12 @@
     const id = c.id;
     r.video = h('video', { controls: true, preload: 'metadata', playsinline: true, onError: () => videoFailed(r) });
     r.noMedia = h('div', { class: 'no-media' }, 'Not rendered yet');
-    r.box = h('div', { class: 'video-box' }, r.video, r.noMedia);
-    r.hook = h('p', { class: 'hook' });
     r.pill = pill(c.status);
     r.score = h('b');
+    r.badge = h('span', { class: 'score-badge', title: 'selection score' }, h('small', {}, 'score'), r.score);
+    r.badges = h('div', { class: 'clip-badges' }, r.badge, r.pill);
+    r.box = h('div', { class: 'video-box' }, r.video, r.noMedia, r.badges);
+    r.hook = h('p', { class: 'hook' });
     r.len = h('b');
     r.vtitle = h('span', { class: 'clip-video muted' });
     r.approve = h('button', { class: 'btn btn-sm btn-primary', type: 'button', onClick: () => setClipStatus(id, 'ready') }, 'Approve');
@@ -670,7 +685,7 @@
       r.box,
       h('div', { class: 'clip-body' },
         r.hook,
-        h('p', { class: 'facts' }, h('span', {}, 'score ', r.score), h('span', {}, 'length ', r.len), r.pill),
+        h('p', { class: 'facts' }, h('span', {}, 'length ', r.len)),
         r.vtitle,
         r.actions,
         r.details));

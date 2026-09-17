@@ -13,15 +13,18 @@
 <div id="offline-banner" class="banner" role="alert" hidden>Server unreachable - retrying every 5 s</div>
 
 <div class="app">
-  <nav class="side" aria-label="Sections">
-    <div class="tabs" role="tablist" aria-orientation="vertical" id="tablist">
-      <button class="tab" role="tab" type="button" id="tabbtn-dashboard" data-tab="dashboard" aria-selected="true" aria-controls="tab-dashboard">Dashboard</button>
-      <button class="tab" role="tab" type="button" id="tabbtn-review" data-tab="review" aria-selected="false" aria-controls="tab-review" tabindex="-1">Review</button>
-      <button class="tab" role="tab" type="button" id="tabbtn-publish" data-tab="publish" aria-selected="false" aria-controls="tab-publish" tabindex="-1">Publish</button>
-      <button class="tab" role="tab" type="button" id="tabbtn-schedule" data-tab="schedule" aria-selected="false" aria-controls="tab-schedule" tabindex="-1">Schedule</button>
-      <button class="tab" role="tab" type="button" id="tabbtn-settings" data-tab="settings" aria-selected="false" aria-controls="tab-settings" tabindex="-1">Settings</button>
+  <nav class="topbar" aria-label="Sections">
+    <div class="topbar-inner">
+      <a class="brand" href="#dashboard">ClipForge</a>
+      <div class="tabs" role="tablist" aria-orientation="horizontal" id="tablist">
+        <button class="tab" role="tab" type="button" id="tabbtn-dashboard" data-tab="dashboard" aria-selected="true" aria-controls="tab-dashboard">Dashboard</button>
+        <button class="tab" role="tab" type="button" id="tabbtn-review" data-tab="review" aria-selected="false" aria-controls="tab-review" tabindex="-1">Review</button>
+        <button class="tab" role="tab" type="button" id="tabbtn-publish" data-tab="publish" aria-selected="false" aria-controls="tab-publish" tabindex="-1">Publish</button>
+        <button class="tab" role="tab" type="button" id="tabbtn-schedule" data-tab="schedule" aria-selected="false" aria-controls="tab-schedule" tabindex="-1">Schedule</button>
+        <button class="tab" role="tab" type="button" id="tabbtn-settings" data-tab="settings" aria-selected="false" aria-controls="tab-settings" tabindex="-1">Settings</button>
+      </div>
+      <div id="nav-busy" class="nav-busy" role="status" hidden><span class="spinner" aria-hidden="true"></span><span id="nav-busy-text">Working</span></div>
     </div>
-    <div id="nav-busy" class="nav-busy" role="status" hidden><span class="spinner" aria-hidden="true"></span><span id="nav-busy-text">Working</span></div>
   </nav>
 
   <main>
@@ -32,9 +35,16 @@
     <!-- ================= Dashboard ================= -->
     <section class="panel" id="tab-dashboard" role="tabpanel" aria-labelledby="tabbtn-dashboard">
       <header class="panel-head">
-        <h1>Dashboard</h1>
+        <div><h1>Dashboard</h1><p class="lede">Queue a video, run the pipeline, watch the jobs. Clips land in Review when they are rendered.</p></div>
         <button class="btn btn-primary" id="run-queue" type="button" title="Process every queued video (pipeline.process_queue)">Run queue</button>
       </header>
+
+      <div class="stats" id="stats" aria-label="Totals">
+        <div class="stat" data-tone="info"><span class="stat-label">Videos</span><span class="stat-value" id="stat-videos">0</span><span class="stat-sub" id="stat-videos-sub">none queued</span></div>
+        <div class="stat" data-tone="accent"><span class="stat-label">To review</span><span class="stat-value" id="stat-rendered">0</span><span class="stat-sub">rendered clips waiting for a decision</span></div>
+        <div class="stat" data-tone="ok"><span class="stat-label">Ready</span><span class="stat-value" id="stat-ready">0</span><span class="stat-sub">approved, waiting to publish</span></div>
+        <div class="stat"><span class="stat-label">Posted</span><span class="stat-value" id="stat-posted">0</span><span class="stat-sub">published clips</span></div>
+      </div>
 
       <section class="card">
         <h2>Add video</h2>
@@ -85,7 +95,7 @@
     <!-- ================= Review ================= -->
     <section class="panel" id="tab-review" role="tabpanel" aria-labelledby="tabbtn-review" hidden>
       <header class="panel-head">
-        <h1>Review</h1>
+        <div><h1>Review</h1><p class="lede">Watch each clip, then approve or reject. Only approved clips can be published.</p></div>
         <button class="btn btn-primary" id="approve-all" type="button">Approve all rendered</button>
       </header>
       <div class="toolbar">
@@ -115,7 +125,7 @@
 
     <!-- ================= Publish ================= -->
     <section class="panel" id="tab-publish" role="tabpanel" aria-labelledby="tabbtn-publish" hidden>
-      <header class="panel-head"><h1>Publish</h1></header>
+      <header class="panel-head"><div><h1>Publish</h1><p class="lede">Connect an account once, then publish approved clips or let the scheduler post them for you.</p></div></header>
 
       <div class="two-col">
         <section class="card platform" id="plat-youtube">
@@ -214,10 +224,9 @@
     <!-- ================= Schedule ================= -->
     <section class="panel" id="tab-schedule" role="tabpanel" aria-labelledby="tabbtn-schedule" hidden>
       <header class="panel-head">
-        <h1>Schedule</h1>
+        <div><h1>Schedule</h1><p class="lede">Posts ready clips at your chosen times, spread across the day, never more than the per-day limit.</p></div>
         <div class="row">
-          <span class="dot" id="sched-dot" aria-hidden="true"></span>
-          <span id="sched-state">stopped</span>
+          <span class="sched-state"><span class="dot" id="sched-dot" aria-hidden="true"></span><span id="sched-state">stopped</span></span>
           <button class="btn btn-primary" id="sched-toggle" type="button">Start scheduler</button>
         </div>
       </header>
@@ -250,7 +259,7 @@
 
     <!-- ================= Settings ================= -->
     <section class="panel" id="tab-settings" role="tabpanel" aria-labelledby="tabbtn-settings" hidden>
-      <header class="panel-head"><h1>Settings</h1></header>
+      <header class="panel-head"><div><h1>Settings</h1><p class="lede">Check the environment, edit clipforge.yaml and see where credentials go.</p></div></header>
       <section class="card">
         <div class="card-head"><h2>Environment check</h2><button class="btn" id="doctor-run" type="button">Run environment check</button></div>
         <p class="muted small" id="doctor-status">Checks ffmpeg, yt-dlp, fonts, whisper, credentials and the workspace. This can take a few seconds.</p>

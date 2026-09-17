@@ -49,7 +49,7 @@ A local single-page app over the same engine, no accounts, no internet needed fo
 
 | Tab | What you do there |
 | --- | --- |
-| Dashboard | paste a URL or local path with the clip options, run the queue, watch video status and job progress |
+| Dashboard | totals at a glance (videos, clips to review, ready, posted), paste a URL or local path with the clip options, run the queue, watch video status and job progress |
 | Review | watch every clip, approve / reject (keys A / R), edit title, description and hashtags |
 | Publish | connect YouTube (Google sign-in opens on this machine) or TikTok (paste the redirect URL back into the page), publish selected clips, or use the manual dialog: copy caption, open the upload page, download the clip, mark as posted |
 | Schedule | start/stop the scheduler inside the UI process, see next slots and limits, run a tick or a dry run, recent activity log |
