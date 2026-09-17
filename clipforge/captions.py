@@ -26,8 +26,8 @@ from .transcript import SENTENCE_END, Word
 log = get_logger(__name__)
 
 BASE_WIDTH = 1080  # StyleCfg pixel sizes are expressed for this frame width
-CAPTION_X = 0.44
-CAPTION_MAX_WIDTH = 0.82
+CAPTION_X = 0.5  # centred (TikTok's right-hand buttons sit below the caption band at pos_y 0.62)
+CAPTION_MAX_WIDTH = 0.80  # a group spans at most 10 %..90 % of the width
 HOOK_X = 0.5
 HOOK_Y = 0.12
 HOOK_MAX_WIDTH = 0.86

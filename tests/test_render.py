@@ -277,3 +277,19 @@ def test_render_all_falls_back_to_sequential_and_render_clip_never_raises(monkey
     assert [r.ok for r in results] == [False, False]
     assert all("file not found" in (r.error or "") for r in results)
     assert all(r.ass_path is None and not r.out.exists() for r in results)
+
+
+# ---- subject tracking + frame verification --------------------------------------------------------------------------
+def test_fill_gaps_keeps_the_subject_in_frame():
+    assert R.fill_gaps([None, None, 100.0, None, None, 400.0, None], 250.0) == [100.0, 100.0, 100.0, 200.0, 300.0, 400.0, 400.0]
+    assert R.fill_gaps([None, None], 250.0) == [250.0, 250.0]
+    assert R.fill_gaps([], 250.0) == []
+
+
+def test_verify_output_rejects_wrong_frames():
+    from clipforge.ffmpeg import MediaInfo
+
+    good = MediaInfo(10.0, 1080, 1920, 30.0, True, True)
+    assert R.verify_output(good, 1080, 1920) is None
+    assert "1080x1080" in R.verify_output(MediaInfo(10.0, 1080, 1080, 30.0, True, True), 1080, 1920)
+    assert "audio" in R.verify_output(MediaInfo(10.0, 1080, 1920, 30.0, False, True), 1080, 1920)

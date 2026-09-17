@@ -263,7 +263,7 @@ def fakes(settings, db, fixture_transcript, monkeypatch) -> Fakes:
 
 def test_effective_options_merges_overrides(settings):
     base = pipeline.effective_options(settings, {})
-    assert base == {"count": 3, "min_s": 6.0, "max_s": 12.0, "style": "hormozi", "layout": "crop", "tighten": False, "smart": False, "punch": False, "force_whisper": False, "music": False}
+    assert base == {"count": 3, "min_s": 6.0, "max_s": 12.0, "style": "hormozi", "layout": "crop", "tighten": False, "smart": True, "punch": False, "force_whisper": False, "music": False}
     merged = pipeline.effective_options(settings, {"count": 1, "style": "clean", "tighten": True, "min_s": None, "music": True})
     assert merged["count"] == 1 and merged["style"] == "clean" and merged["tighten"] is True and merged["music"] is True
     assert merged["min_s"] == 6.0 and merged["max_s"] == 12.0

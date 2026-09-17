@@ -85,6 +85,16 @@ class RenderResult:
     ass_path: Path | None = None
 
 
+def verify_output(info: F.MediaInfo, width: int, height: int) -> str | None:
+    """Reject a clip that is not exactly the configured frame (1080x1920 by default: the 9:16 frame YouTube Shorts and
+    TikTok expect) or that lost its audio track; None when the file is right."""
+    if (info.width, info.height) != (width, height):
+        return f"rendered {info.width}x{info.height}, expected {width}x{height}"
+    if not info.has_video or not info.has_audio:
+        return "rendered file lacks a video or audio stream"
+    return None
+
+
 def pick_encoder(render: RenderCfg) -> str:
     """'auto' -> h264_nvenc if a probe encode succeeds else libx264."""
     if render.encoder != "auto":
@@ -194,7 +204,7 @@ def crop_size(src_w: int, src_h: int, width: int, height: int) -> tuple[int, int
     return _even(crop_w), _even(crop_h)
 
 
-def smart_crop_x(source: Path, start: float, end: float, src_w: int, src_h: int, crop_w: int, fps_sample: float = 1.0) -> list[tuple[float, int]]:
+def smart_crop_x(source: Path, start: float, end: float, src_w: int, src_h: int, crop_w: int, fps_sample: float = 2.0) -> list[tuple[float, int]]:
     """Sample frames at fps_sample, detect faces with OpenCV's bundled Haar cascade, return smoothed (t_rel, x) keyframes
     for a crop_w-wide window. No faces -> centred. Never raises (falls back to centre)."""
     centre = max(0, (src_w - crop_w) // 2)
@@ -210,8 +220,10 @@ def smart_crop_x(source: Path, start: float, end: float, src_w: int, src_h: int,
 
 
 def _face_positions(source: Path, start: float, end: float, src_w: int, crop_w: int, fps_sample: float, centre: int) -> tuple[list[float], list[float]]:
-    """Raw crop x per sample (t_rel, x): the largest face's centre, or the previous position when no face is seen.
-    The segment is decoded once sequentially; only every fps/fps_sample-th frame is converted and scanned."""
+    """Raw crop x per sample (t_rel, x) that keeps the subject in frame: the face group's centre when every face fits
+    in the crop window, else the largest face. Samples without a face are filled by fill_gaps (see there), so a
+    speaker who is off-centre from the first frame is never shown as an empty room. The segment is decoded once
+    sequentially; only every fps/fps_sample-th frame is converted and scanned."""
     import cv2
 
     cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -221,12 +233,11 @@ def _face_positions(source: Path, start: float, end: float, src_w: int, crop_w: 
     if not cap.isOpened():
         raise RuntimeError(f"cannot open {source}")
     times: list[float] = []
-    xs: list[float] = []
+    raw: list[float | None] = []
     try:
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         every = max(1, int(round(fps / max(fps_sample, 1e-3))))
         cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000.0)
-        x = float(centre)
         max_x = max(0, src_w - crop_w)
         for i in range(int(round((end - start) * fps))):
             if not cap.grab():
@@ -234,18 +245,36 @@ def _face_positions(source: Path, start: float, end: float, src_w: int, crop_w: 
             if i % every:
                 continue
             ok, frame = cap.retrieve()
-            cx = _largest_face_cx(cascade, frame, src_w) if ok else None
-            if cx is not None:
-                x = min(max_x, max(0.0, cx - crop_w / 2))
+            cx = _subject_cx(cascade, frame, src_w, crop_w) if ok else None
             times.append(i / fps)
-            xs.append(x)
+            raw.append(None if cx is None else min(max_x, max(0.0, cx - crop_w / 2)))
     finally:
         cap.release()
-    return times, xs
+    return times, fill_gaps(raw, float(centre))
 
 
-def _largest_face_cx(cascade, frame, src_w: int) -> float | None:
-    """Centre x (in source pixels) of the largest face in the frame, detected on a DETECT_WIDTH-wide copy."""
+def fill_gaps(raw: list[float | None], centre: float) -> list[float]:
+    """Replace samples without a detection: leading gaps take the first detection (the speaker was there, just not
+    found yet), trailing gaps hold the last one, inner gaps interpolate linearly between their neighbours so the
+    crop glides instead of jumping. No detection at all -> the centred crop."""
+    known = [i for i, v in enumerate(raw) if v is not None]
+    if not known:
+        return [centre] * len(raw)
+    out = [float(v) if v is not None else 0.0 for v in raw]
+    first, last = known[0], known[-1]
+    for i in range(first):
+        out[i] = float(raw[first])
+    for i in range(last + 1, len(raw)):
+        out[i] = float(raw[last])
+    for a, b in zip(known, known[1:]):
+        for i in range(a + 1, b):
+            out[i] = float(raw[a]) + (float(raw[b]) - float(raw[a])) * (i - a) / (b - a)
+    return out
+
+
+def _subject_cx(cascade, frame, src_w: int, crop_w: int) -> float | None:
+    """Centre x (source pixels) of the subject: all faces when they fit inside one crop window, else the largest
+    face. Detected on a DETECT_WIDTH-wide copy."""
     import cv2
 
     h, w = frame.shape[:2]
@@ -255,8 +284,13 @@ def _largest_face_cx(cascade, frame, src_w: int) -> float | None:
     faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(24, 24))
     if len(faces) == 0:
         return None
+    scale = src_w / frame.shape[1]
+    left = min(float(f[0]) for f in faces) * scale
+    right = max(float(f[0]) + float(f[2]) for f in faces) * scale
+    if right - left <= crop_w * 0.9:
+        return (left + right) / 2
     x, _y, fw, _fh = max(faces, key=lambda f: int(f[2]) * int(f[3]))
-    return (float(x) + float(fw) / 2) * src_w / frame.shape[1]
+    return (float(x) + float(fw) / 2) * scale
 
 
 def smooth_positions(xs: list[float], alpha: float = 0.3, max_step: float | None = None) -> list[float]:
@@ -465,7 +499,12 @@ def _render(job: RenderJob, ass_path: Path, tmp: Path) -> RenderResult:
         log.error("ffmpeg failed for %s (rc=%d): %s", job.out.name, cp.returncode, err[-400:])
         return RenderResult(job.out, False, cuts=abs_cuts, error=err[-1500:], cmd=cmd, ass_path=ass_path)
     os.replace(tmp, job.out)
-    duration = F.probe(job.out).duration
+    info = F.probe(job.out)
+    problem = verify_output(info, job.render.width, job.render.height)
+    if problem:
+        job.out.unlink(missing_ok=True)
+        return RenderResult(job.out, False, error=problem, cuts=cuts, cmd=cmd, ass_path=ass_path)
+    duration = info.duration
     log.info("rendered %s: %.2fs, %d cut(s), %d punch(es)", job.out.name, duration, len(cuts), len(punch_times))
     return RenderResult(job.out, True, duration=duration, cuts=abs_cuts, cmd=cmd, ass_path=ass_path)
 
